@@ -1,0 +1,273 @@
+name: Generate prime chunks & release (1..6e12)
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag for release (留空自动生成)"
+        required: false
+        type: string
+      prerelease:
+        description: "标记为预发布 (prerelease)"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: Build prime-sieve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libzstd-dev zip
+
+      - name: Configure (Release)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (prefer static)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if cmake --build build -j --target prime-sieve-static; then
+            cp build/prime-sieve-static build/prime-sieve
+          else
+            cmake --build build -j --target prime-sieve
+          fi
+          chmod +x build/prime-sieve
+
+      - name: Smoke test
+        run: ./build/prime-sieve --to 100000 --count --time
+
+      - name: Upload prime-sieve artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: calcprime-bin
+          path: build/prime-sieve
+          if-no-files-found: error
+          retention-days: 7
+
+  create-release:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: Create or ensure release exists
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select token (prefer GH_PAT for forks)
+        shell: bash
+        run: |
+          if [[ -n "${{ secrets.GH_PAT }}" ]]; then
+            echo "GH_TOKEN=${{ secrets.GH_PAT }}" >> "$GITHUB_ENV"
+          else
+            echo "GH_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Resolve tag (use input, else auto-generate)
+        id: tag
+        shell: bash
+        run: |
+          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            DATE=$(date -u +%Y%m%d-%H%M%S)
+            SHA=$(git rev-parse --short=7 HEAD)
+            TAG="v${DATE}-${SHA}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: $TAG"
+
+      - name: Create release if missing (will create tag too)
+        env:
+          PRERELEASE: ${{ github.event.inputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG='${{ steps.tag.outputs.tag }}'
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在"
+          else
+            echo "创建 Release $TAG（target=$GITHUB_SHA）"
+            if [[ "$PRERELEASE" == "true" ]]; then
+              gh release create "$TAG" --title "$TAG" --notes "Automated prime chunks for [1,6e12]" --target "$GITHUB_SHA" --prerelease
+            else
+              gh release create "$TAG" --title "$TAG" --notes "Automated prime chunks for [1,6e12]" --target "$GITHUB_SHA" --latest
+            fi
+          fi
+
+  # ===== Phase A: [1, 4e11], step = 1e10 → 40 blocks (120 files) =====
+  generate-A:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: A group start=${{ matrix.start }} (1e10 step)
+    needs: [build, create-release]
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: ${{ (vars.PRIME_MAX_PARALLEL && fromJSON(vars.PRIME_MAX_PARALLEL)) || 2 }}
+      fail-fast: false
+      matrix:
+        start: [0, 10, 20, 30]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select token (prefer GH_PAT for forks)
+        shell: bash
+        run: |
+          if [[ -n "${{ secrets.GH_PAT }}" ]]; then
+            echo "GH_TOKEN=${{ secrets.GH_PAT }}" >> "$GITHUB_ENV"
+          else
+            echo "GH_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip
+
+      - name: Download prime-sieve artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: calcprime-bin
+          path: build
+
+      - name: Make binary executable
+        run: chmod +x build/prime-sieve || true
+
+      - name: Generate & upload this group (10 blocks of 1e10)
+        shell: bash
+        env:
+          TAG: ${{ needs.create-release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          BASE=10000000000      # 1e10
+          GROUP_START=${{ matrix.start }}
+          GROUP_SIZE=10
+          for d in $(seq 0 $((GROUP_SIZE-1))); do
+            IDX=$((GROUP_START + d))
+            [[ $IDX -ge 40 ]] && break
+            FROM=$(( IDX*BASE + 1 ))
+            TO_EXCL=$(( (IDX+1)*BASE + 1 ))
+            TO_INCL=$(( TO_EXCL - 1 ))
+            NAME="${FROM}-${TO_INCL}"
+            OUTDIR="out/$NAME"
+            mkdir -p "$OUTDIR"
+
+            ./build/prime-sieve --from "$FROM" --to "$TO_EXCL" --print \
+              --out "$OUTDIR/primes_${NAME}.txt" --out-format text
+            ./build/prime-sieve --from "$FROM" --to "$TO_EXCL" --print \
+              --out "$OUTDIR/primes_${NAME}.bin" --out-format binary
+            ./build/prime-sieve --from "$FROM" --to "$TO_EXCL" --print \
+              --out "$OUTDIR/primes_${NAME}.zst" --out-format zstd
+
+            ( cd "$OUTDIR" && \
+              zip -m -j "primes_${NAME}.txt.zip" "primes_${NAME}.txt" && \
+              zip -m -j "primes_${NAME}.bin.zip" "primes_${NAME}.bin" && \
+              zip -m -j "primes_${NAME}.zst.zip" "primes_${NAME}.zst" )
+
+            gh release upload "$TAG" \
+              "out/$NAME/primes_${NAME}.txt.zip" \
+              "out/$NAME/primes_${NAME}.bin.zip" \
+              "out/$NAME/primes_${NAME}.zst.zip" \
+              --clobber
+
+            rm -rf "out/$NAME" || true
+          done
+
+  # ===== Phase B: (4e11, 6e12], step = 2e10 → 280 blocks (840 files) =====
+  generate-B:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: B group start=${{ matrix.start }} (2e10 step)
+    needs: [build, create-release]
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: ${{ (vars.PRIME_MAX_PARALLEL && fromJSON(vars.PRIME_MAX_PARALLEL)) || 2 }}
+      fail-fast: false
+      matrix:
+        start: [0,10,20,30,40,50,60,70,80,90,
+                100,110,120,130,140,150,160,170,180,190,
+                200,210,220,230,240,250,260,270]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select token (prefer GH_PAT for forks)
+        shell: bash
+        run: |
+          if [[ -n "${{ secrets.GH_PAT }}" ]]; then
+            echo "GH_TOKEN=${{ secrets.GH_PAT }}" >> "$GITHUB_ENV"
+          else
+            echo "GH_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip
+
+      - name: Download prime-sieve artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: calcprime-bin
+          path: build
+
+      - name: Make binary executable
+        run: chmod +x build/prime-sieve || true
+
+      - name: Generate & upload this group (10 blocks of 2e10)
+        shell: bash
+        env:
+          TAG: ${{ needs.create-release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          BASE=20000000000          # 2e10
+          OFFSET=$((400000000000))  # 4e11（A 段末端）
+          GROUP_START=${{ matrix.start }}
+          GROUP_SIZE=10
+          for d in $(seq 0 $((GROUP_SIZE-1))); do
+            REL=$((GROUP_START + d))
+            [[ $REL -ge 280 ]] && break
+            FROM=$(( OFFSET + REL*BASE + 1 ))  # 半开区间起点 +1
+            TO_EXCL=$(( FROM + BASE ))
+            TO_INCL=$(( TO_EXCL - 1 ))
+            NAME="${FROM}-${TO_INCL}"
+            OUTDIR="out/$NAME"
+            mkdir -p "$OUTDIR"
+
+            ./build/prime-sieve --from "$FROM" --to "$TO_EXCL" --print \
+              --out "$OUTDIR/primes_${NAME}.txt" --out-format text
+            ./build/prime-sieve --from "$FROM" --to "$TO_EXCL" --print \
+              --out "$OUTDIR/primes_${NAME}.bin" --out-format binary
+            ./build/prime-sieve --from "$FROM" --to "$TO_EXCL" --print \
+              --out "$OUTDIR/primes_${NAME}.zst" --out-format zstd
+
+            ( cd "$OUTDIR" && \
+              zip -m -j "primes_${NAME}.txt.zip" "primes_${NAME}.txt" && \
+              zip -m -j "primes_${NAME}.bin.zip" "primes_${NAME}.bin" && \
+              zip -m -j "primes_${NAME}.zst.zip" "primes_${NAME}.zst" )
+
+            gh release upload "$TAG" \
+              "out/$NAME/primes_${NAME}.txt.zip" \
+              "out/$NAME/primes_${NAME}.bin.zip" \
+              "out/$NAME/primes_${NAME}.zst.zip" \
+              --clobber
+
+            rm -rf "out/$NAME" || true
+          done
