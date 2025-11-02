@@ -1,4 +1,4 @@
-name: Unified Build (Linux + Windows + macOS + ARM) with optional Release
+name: Unified Build (Linux + Windows) with optional Release
 
 on:
   workflow_dispatch:
@@ -16,13 +16,7 @@ on:
 permissions:
   contents: write
 
-env:
-  CMAKE_BUILD_TYPE: Release
-
 jobs:
-  # =========================
-  # 原有 Linux x86_64 容器矩阵（保持功能不变）
-  # =========================
   linux:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     name: Linux (${{ matrix.label }})
@@ -37,6 +31,7 @@ jobs:
             container: debian:bullseye
             cc: gcc
             cxx: g++
+            # 老基线 + 线程可能需要 atomic
             link_flags: "-static-libstdc++ -static-libgcc -pthread -latomic"
             artifact_suffix: glibc231
             zstd_from_source: "false"
@@ -56,14 +51,14 @@ jobs:
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 build-essential cmake ninja-build pkg-config git ccache libzstd-dev
-          # glibc 2.39: Ubuntu 24.04 —— 源码构建静态且 PIC 的 zstd
+          # glibc 2.39: Ubuntu 24.04 —— 改为源码构建静态且 PIC 的 zstd
           - label: glibc239-ubuntu2404-gcc
             container: ubuntu:24.04
             cc: gcc
             cxx: g++
             link_flags: "-static-libstdc++ -static-libgcc -pthread"
             artifact_suffix: glibc239
-            zstd_from_source: "true"
+            zstd_from_source: "true"   # <= 关键改动：避免把非 PIC 的系统 libzstd.a 链到 .so
             install: |
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -73,6 +68,7 @@ jobs:
             container: alpine:3.20
             cc: gcc
             cxx: g++
+            # musl 下真正全静态
             link_flags: "-static -pthread"
             artifact_suffix: musl_static
             zstd_from_source: "true"
@@ -95,6 +91,452 @@ jobs:
         env:
           ZSTD_FROM_SOURCE: ${{ matrix.zstd_from_source }}
         run: |
+          set -eux
+          : > /tmp/setenv
+
+          make_zstd_static_from_source () {
+            ZSTD_VER=v1.5.6
+            git clone --depth=1 --branch "${ZSTD_VER}" https://github.com/facebook/zstd.git
+            cmake -S zstd/build/cmake -B zstd_build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DZSTD_BUILD_SHARED=OFF \
+              -DZSTD_BUILD_STATIC=ON \
+              -DZSTD_LEGACY_SUPPORT=OFF \
+              -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+              -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/deps/zstd"
+            cmake --build zstd_build -j
+            cmake --install zstd_build
+            echo "ZSTD_INCLUDE_DIR=$GITHUB_WORKSPACE/deps/zstd/include" >> /tmp/setenv
+            echo "ZSTD_LIBRARY=$GITHUB_WORKSPACE/deps/zstd/lib/libzstd.a" >> /tmp/setenv
+          }
+
+          if [ "${ZSTD_FROM_SOURCE}" = "true" ]; then
+            # 源码编译静态且 PIC 的 libzstd.a（适配给 .so 使用）
+            make_zstd_static_from_source
+          else
+            # glibc：优先使用系统的静态 libzstd.a，不存在则源码兜底
+            if [ -f /etc/debian_version ] || [ -f /etc/lsb-release ]; then
+              ZSTD_A="$(find /usr/lib /usr/local/lib -name 'libzstd.a' -print -quit || true)"
+              if [ -n "${ZSTD_A}" ]; then
+                echo "Using system static zstd: ${ZSTD_A}"
+                if [ -f /usr/include/zstd.h ]; then
+                  echo "ZSTD_INCLUDE_DIR=/usr/include" >> /tmp/setenv
+                else
+                  INC="$(dirname "$(dirname "${ZSTD_A}")")/include"
+                  [ -f "${INC}/zstd.h" ] || INC="/usr/local/include"
+                  echo "ZSTD_INCLUDE_DIR=${INC}" >> /tmp/setenv
+                fi
+                echo "ZSTD_LIBRARY=${ZSTD_A}" >> /tmp/setenv
+              else
+                echo "System static libzstd.a not found, building from source..."
+                make_zstd_static_from_source
+              fi
+            else
+              make_zstd_static_from_source
+            fi
+          fi
+
+          cat /tmp/setenv >> "$GITHUB_ENV"
+
+      - name: Configure (CMake + Ninja + ccache)
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+          LINK_FLAGS: ${{ matrix.link_flags }}
+        run: |
+          set -eux
+          EXTRA_ZSTD_ARGS=""
+          RPATH_ARG=""   # 我们静态链接 zstd，不需要 RPATH
+
+          THREAD_FLAGS="-pthread"
+          if [ -n "${ZSTD_INCLUDE_DIR:-}" ] && [ -n "${ZSTD_LIBRARY:-}" ]; then
+            EXTRA_ZSTD_ARGS="-DZSTD_INCLUDE_DIR=${ZSTD_INCLUDE_DIR} -DZSTD_LIBRARY=${ZSTD_LIBRARY}"
+          fi
+
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_FLAGS="${THREAD_FLAGS}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${LINK_FLAGS}" \
+            ${RPATH_ARG} \
+            ${EXTRA_ZSTD_ARGS}
+
+      - name: Build
+        run: |
+          set -eux
+          cmake --build build -j
+
+      - name: Smoke test
+        run: |
+          set -eux
+          ./build/prime-sieve --help || true
+          ctest --test-dir build --output-on-failure || true
+
+      - name: Collect artifacts
+        run: |
+          set -eux
+          mkdir -p out/${{ matrix.label }}
+          [ -f build/prime-sieve ] && cp build/prime-sieve out/${{ matrix.label }}/prime-sieve-${{ matrix.artifact_suffix }}
+          [ -f build/prime-sieve-static ] && cp build/prime-sieve-static out/${{ matrix.label }}/prime-sieve-static-${{ matrix.artifact_suffix }} || true
+          ls build | grep -E '^libcalcprime(-cli)?\.' >/dev/null 2>&1 && cp build/libcalcprime* out/${{ matrix.label }}/ || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.artifact_suffix }}
+          path: out/${{ matrix.label }}/
+          if-no-files-found: warn
+
+  windows:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: Windows (${{ matrix.triplet }} • ${{ matrix.config }})
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Release]
+        triplet: [x64-windows-static, x64-windows]   # 静态&动态两份
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 用 vcpkg-action 安装依赖并开启缓存（会把 vcpkg 放在 ${{github.workspace}}\vcpkg）
+      - name: Setup vcpkg and install deps
+        id: vcpkg
+        uses: johnwason/vcpkg-action@v7
+        with:
+          pkgs: zstd
+          triplet: ${{ matrix.triplet }}
+          token: ${{ github.token }}
+
+      - name: Configure (CMake, MSVC)
+        shell: pwsh
+        run: >
+          cmake ${{ steps.vcpkg.outputs.vcpkg-cmake-config }}
+          -S . -B build\${{ matrix.triplet }}
+          -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+          -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build\${{ matrix.triplet }} --config ${{ matrix.config }} --parallel
+
+      # 收集并打包
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          $pkg = "package\${{ matrix.triplet }}\${{ matrix.config }}"
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+
+          # 可执行文件
+          Get-ChildItem -Path "build\${{ matrix.triplet }}\${{ matrix.config }}" -Filter *.exe -Recurse | Copy-Item -Destination $pkg -Force
+
+          # 动态三元组需要携带 vcpkg 安装的 DLL
+          if ("${{ matrix.triplet }}" -eq "x64-windows") {
+            $vcpkgBin = "${{ github.workspace }}\vcpkg\installed\${{ matrix.triplet }}\bin"
+            if (Test-Path $vcpkgBin) { Copy-Item "$vcpkgBin\*.dll" $pkg -Force -ErrorAction SilentlyContinue }
+          }
+
+          if (Test-Path "README.md") { Copy-Item "README.md" $pkg }
+          if (Test-Path "LICENSE")  { Copy-Item "LICENSE"  $pkg }
+
+      - name: Zip package
+        shell: pwsh
+        run: |
+          $zip = "build-${{ matrix.triplet }}-${{ matrix.config }}.zip"
+          Compress-Archive -Path "package\${{ matrix.triplet }}\${{ matrix.config }}\*" -DestinationPath $zip -Force
+          echo "ZIP_NAME=$zip" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error
+
+  # =========================
+  # 新增：Linux ARM64
+  # =========================
+  linux_arm:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: Linux (ARM64)
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential cmake ninja-build pkg-config git ccache libzstd-dev
+
+      - name: Configure & Build (ARM64)
+        run: |
+          set -eux
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+
+      - name: Collect artifacts
+        run: |
+          set -eux
+          mkdir -p out/arm64
+          [ -f build/prime-sieve ] && cp build/prime-sieve out/arm64/ || true
+          [ -f build/prime-sieve-static ] && cp build/prime-sieve-static out/arm64/ || true
+          ls build | grep -E '^libcalcprime(-cli)?\.' >/dev/null 2>&1 && cp build/libcalcprime* out/arm64/ || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: out/arm64/
+          if-no-files-found: warn
+
+  # =========================
+  # 新增：Linux x86_64（禁用 AVX）
+  # =========================
+  linux_noavx:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: "Linux (no-AVX baseline)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential cmake ninja-build pkg-config git ccache libzstd-dev
+
+      - name: Configure & Build (no-AVX)
+        run: |
+          set -eux
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-march=x86-64 -mno-avx -mno-avx2 -mno-avx512f" \
+            -DCMAKE_CXX_FLAGS="-march=x86-64 -mno-avx -mno-avx2 -mno-avx512f"
+          cmake --build build -j
+
+      - name: Collect artifacts
+        run: |
+          set -eux
+          mkdir -p out/noavx
+          [ -f build/prime-sieve ] && cp build/prime-sieve out/noavx/ || true
+          [ -f build/prime-sieve-static ] && cp build/prime-sieve-static out/noavx/ || true
+          ls build | grep -E '^libcalcprime(-cli)?\.' >/dev/null 2>&1 && cp build/libcalcprime* out/noavx/ || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-noavx
+          path: out/noavx/
+          if-no-files-found: warn
+
+  # =========================
+  # 新增：Windows ARM64（交叉编译）
+  # =========================
+  windows_arm:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: Windows (ARM64 • ${{ matrix.config }})
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Release]
+        triplet: [arm64-windows-static, arm64-windows]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup vcpkg and install deps
+        id: vcpkg
+        uses: johnwason/vcpkg-action@v7
+        with:
+          pkgs: zstd
+          triplet: ${{ matrix.triplet }}
+          token: ${{ github.token }}
+
+      - name: Configure (CMake, MSVC ARM64)
+        shell: pwsh
+        run: >
+          cmake ${{ steps.vcpkg.outputs.vcpkg-cmake-config }}
+          -S . -B build\${{ matrix.triplet }}
+          -G "Visual Studio 17 2022" -A ARM64
+          -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+          -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build\${{ matrix.triplet }} --config ${{ matrix.config }} --parallel
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          $pkg = "package\${{ matrix.triplet }}\${{ matrix.config }}"
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Get-ChildItem -Path "build\${{ matrix.triplet }}\${{ matrix.config }}" -Filter *.exe -Recurse | Copy-Item -Destination $pkg -Force
+          if ("${{ matrix.triplet }}" -eq "arm64-windows") {
+            $vcpkgBin = "${{ github.workspace }}\vcpkg\installed\${{ matrix.triplet }}\bin"
+            if (Test-Path $vcpkgBin) { Copy-Item "$vcpkgBin\*.dll" $pkg -Force -ErrorAction SilentlyContinue }
+          }
+          if (Test-Path "README.md") { Copy-Item "README.md" $pkg }
+          if (Test-Path "LICENSE")  { Copy-Item "LICENSE"  $pkg }
+
+      - name: Zip package
+        shell: pwsh
+        run: |
+          $zip = "build-${{ matrix.triplet }}-${{ matrix.config }}.zip"
+          Compress-Archive -Path "package\${{ matrix.triplet }}\${{ matrix.config }}\*" -DestinationPath $zip -Force
+          echo "ZIP_NAME=$zip" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error
+
+  # =========================
+  # 新增：Windows x64（no-AVX，带守门）
+  # =========================
+  windows_noavx:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: "Windows (x64 • no-AVX • ${{ matrix.config }})"
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Release]
+        triplet: [x64-windows-static, x64-windows]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup vcpkg and install deps
+        id: vcpkg
+        uses: johnwason/vcpkg-action@v7
+        with:
+          pkgs: zstd
+          triplet: ${{ matrix.triplet }}
+          token: ${{ github.token }}
+
+      - name: Configure (CMake, MSVC x64)
+        shell: pwsh
+        run: >
+          cmake ${{ steps.vcpkg.outputs.vcpkg-cmake-config }}
+          -S . -B build\${{ matrix.triplet }}
+          -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+          -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+
+      - name: Build (capture log)
+        shell: pwsh
+        run: cmake --build build\${{ matrix.triplet }} --config ${{ matrix.config }} --parallel | Tee-Object -FilePath buildlog.txt
+
+      - name: "Guard: fail if any AVX flags appear"
+        shell: pwsh
+        run: |
+          if (Select-String -Pattern "/arch:AVX" -Path buildlog.txt) {
+            Write-Host "Found AVX flags in MSVC build. Failing."; exit 1
+          }
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          $pkg = "package\${{ matrix.triplet }}\${{ matrix.config }}"
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Get-ChildItem -Path "build\${{ matrix.triplet }}\${{ matrix.config }}" -Filter *.exe -Recurse | Copy-Item -Destination $pkg -Force
+          if ("${{ matrix.triplet }}" -eq "x64-windows") {
+            $vcpkgBin = "${{ github.workspace }}\vcpkg\installed\${{ matrix.triplet }}\bin"
+            if (Test-Path $vcpkgBin) { Copy-Item "$vcpkgBin\*.dll" $pkg -Force -ErrorAction SilentlyContinue }
+          }
+          if (Test-Path "README.md") { Copy-Item "README.md" $pkg }
+          if (Test-Path "LICENSE")  { Copy-Item "LICENSE"  $pkg }
+
+      - name: Zip package (no-AVX)
+        shell: pwsh
+        run: |
+          $zip = "build-${{ matrix.triplet }}-${{ matrix.config }}-noavx.zip"
+          Compress-Archive -Path "package\${{ matrix.triplet }}\${{ matrix.config }}\*" -DestinationPath $zip -Force
+          echo "ZIP_NAME=$zip" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error
+
+  release:
+    if: ${{ github.event.inputs.tag != '' && github.event_name == 'workflow_dispatch' }}
+    name: Create Release
+    needs: [linux, linux_arm, linux_noavx, windows, windows_arm, windows_noavx]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Pack artifacts for Release
+        run: |
+          set -eux
+          mkdir -p release
+
+          # 1) 先拷贝 Windows 打包好的 zip
+          find artifacts -type f -name '*.zip' -exec cp {} release/ \;
+
+          # 2) 将 Linux 工件目录各自 zip（仅限名为 linux-* 的目录，避免重复打包 Windows）
+          for d in artifacts/linux-*; do
+            [ -d "$d" ] || continue
+            name="$(basename "$d")"
+            (cd "$d" && zip -r "../../release/${name}.zip" .)
+          done
+
+          ls -lh release
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          name: ${{ github.event.inputs.tag }}
+          prerelease: ${{ github.event.inputs.prerelease }}
+          files: |
+            release/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}          mkdir -p release
+
+          # 1) 先拷贝 Windows 打包好的 zip
+          find artifacts -type f -name '*.zip' -exec cp {} release/ \;
+
+          # 2) 将 Linux 工件目录各自 zip（仅限名为 linux-* 的目录，避免重复打包 Windows）
+          for d in artifacts/linux-*; do
+            [ -d "$d" ] || continue
+            name="$(basename "$d")"
+            (cd "$d" && zip -r "../../release/${name}.zip" .)
+          done
+
+          ls -lh release
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          name: ${{ github.event.inputs.tag }}
+          prerelease: ${{ github.event.inputs.prerelease }}
+          files: |
+            release/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}        run: |
           set -eux
           : > /tmp/setenv
 
