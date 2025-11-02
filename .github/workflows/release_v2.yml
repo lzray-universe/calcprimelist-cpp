@@ -1,0 +1,452 @@
+name: Unified Build (Linux + Windows + macOS + ARM) with optional Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag for release (留空只构建不发布)"
+        required: false
+        type: string
+      prerelease:
+        description: "标记为预发布 (prerelease)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  CMAKE_BUILD_TYPE: Release
+
+jobs:
+  # =========================
+  # 原有 Linux x86_64 容器矩阵（保持功能不变）
+  # =========================
+  linux:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: Linux (${{ matrix.label }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc 2.31: Debian 11 (bullseye)
+          - label: glibc231-debian11-gcc
+            container: debian:bullseye
+            cc: gcc
+            cxx: g++
+            link_flags: "-static-libstdc++ -static-libgcc -pthread -latomic"
+            artifact_suffix: glibc231
+            zstd_from_source: "false"
+            install: |
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                build-essential cmake ninja-build pkg-config git ccache libzstd-dev
+          # glibc 2.35: Ubuntu 22.04
+          - label: glibc235-ubuntu2204-gcc
+            container: ubuntu:22.04
+            cc: gcc
+            cxx: g++
+            link_flags: "-static-libstdc++ -static-libgcc -pthread"
+            artifact_suffix: glibc235
+            zstd_from_source: "false"
+            install: |
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                build-essential cmake ninja-build pkg-config git ccache libzstd-dev
+          # glibc 2.39: Ubuntu 24.04 —— 源码构建静态且 PIC 的 zstd
+          - label: glibc239-ubuntu2404-gcc
+            container: ubuntu:24.04
+            cc: gcc
+            cxx: g++
+            link_flags: "-static-libstdc++ -static-libgcc -pthread"
+            artifact_suffix: glibc239
+            zstd_from_source: "true"
+            install: |
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                build-essential cmake ninja-build pkg-config git ccache libzstd-dev
+          # musl 全静态: Alpine 3.20
+          - label: musl-static-alpine320-gcc
+            container: alpine:3.20
+            cc: gcc
+            cxx: g++
+            link_flags: "-static -pthread"
+            artifact_suffix: musl_static
+            zstd_from_source: "true"
+            install: |
+              set -eux
+              apk add --no-cache build-base cmake ninja pkgconfig git ccache
+
+    container: ${{ matrix.container }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain & base deps
+        run: |
+          set -eux
+          ${{ matrix.install }}
+
+      - name: Prepare zstd (always static for portability when building from source)
+        env:
+          ZSTD_FROM_SOURCE: ${{ matrix.zstd_from_source }}
+        run: |
+          set -eux
+          : > /tmp/setenv
+
+          make_zstd_static_from_source () {
+            ZSTD_VER=v1.5.6
+            git clone --depth=1 --branch "${ZSTD_VER}" https://github.com/facebook/zstd.git
+            cmake -S zstd/build/cmake -B zstd_build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DZSTD_BUILD_SHARED=OFF \
+              -DZSTD_BUILD_STATIC=ON \
+              -DZSTD_LEGACY_SUPPORT=OFF \
+              -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+              -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/deps/zstd"
+            cmake --build zstd_build -j
+            cmake --install zstd_build
+            echo "ZSTD_INCLUDE_DIR=$GITHUB_WORKSPACE/deps/zstd/include" | tee -a /tmp/setenv >> $GITHUB_ENV
+            echo "ZSTD_LIBRARY=$GITHUB_WORKSPACE/deps/zstd/lib/libzstd.a" | tee -a /tmp/setenv >> $GITHUB_ENV
+          }
+
+          if [ "${ZSTD_FROM_SOURCE}" = "true" ]; then
+            make_zstd_static_from_source
+          else
+            if [ -f /etc/debian_version ] || [ -f /etc/lsb-release ]; then
+              ZSTD_A="$(find /usr/lib /usr/local/lib -name 'libzstd.a' -print -quit || true)"
+              if [ -n "${ZSTD_A}" ]; then
+                echo "Using system static zstd: ${ZSTD_A}"
+                if [ -f /usr/include/zstd.h ]; then
+                  echo "ZSTD_INCLUDE_DIR=/usr/include" | tee -a /tmp/setenv >> $GITHUB_ENV
+                else
+                  INC="$(dirname "$(dirname "${ZSTD_A}")")/include"
+                  [ -f "${INC}/zstd.h" ] || INC="/usr/local/include"
+                  echo "ZSTD_INCLUDE_DIR=${INC}" | tee -a /tmp/setenv >> $GITHUB_ENV
+                fi
+                echo "ZSTD_LIBRARY=${ZSTD_A}" | tee -a /tmp/setenv >> $GITHUB_ENV
+              else
+                echo "System static libzstd.a not found, building from source..."
+                make_zstd_static_from_source
+              fi
+            else
+              make_zstd_static_from_source
+            fi
+          fi
+
+      - name: Configure & Build
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          set -eux
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.link_flags }}" \
+            -DZSTD_INCLUDE_DIR="$ZSTD_INCLUDE_DIR" \
+            -DZSTD_LIBRARY="$ZSTD_LIBRARY"
+          cmake --build build -j
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: calcprime-linux-${{ matrix.artifact_suffix }}
+          path: |
+            build/prime-sieve*
+            build/lib*.a
+          if-no-files-found: warn
+
+  # =========================
+  # Linux x86_64 - NO AVX
+  # =========================
+  linux_noavx:
+    needs: linux
+    name: Linux (no-AVX baseline)
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential cmake ninja-build pkg-config git ccache libzstd-dev
+      - name: Build (force no AVX)
+        run: |
+          set -eux
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+            -DCMAKE_C_FLAGS="-march=x86-64 -mno-avx -mno-avx2 -mno-avx512f" \
+            -DCMAKE_CXX_FLAGS="-march=x86-64 -mno-avx -mno-avx2 -mno-avx512f"
+          cmake --build build -j
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: calcprime-linux-noavx
+          path: build/prime-sieve*
+          if-no-files-found: warn
+
+  # =========================
+  # Linux ARM64（公共仓库有官方 arm64 runner 标签）
+  # =========================
+  linux_arm64:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: Linux ARM64 (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm   # 公共仓库标签。私有仓库会失败。4
+            label: glibc240-ubuntu2404-arm64
+            container: ubuntu:24.04
+            install: |
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                build-essential cmake ninja-build pkg-config git ccache libzstd-dev
+            artifact_suffix: linux_arm64
+            zstd_from_source: "true"
+          - os: ubuntu-22.04-arm   # 公共仓库标签。私有仓库会失败。5
+            label: glibc235-ubuntu2204-arm64
+            container: ubuntu:22.04
+            install: |
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                build-essential cmake ninja-build pkg-config git ccache libzstd-dev
+            artifact_suffix: linux_arm64
+            zstd_from_source: "false"
+    container: ${{ matrix.container }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          set -eux
+          ${{ matrix.install }}
+      - name: zstd (static, PIC)
+        env:
+          ZSTD_FROM_SOURCE: ${{ matrix.zstd_from_source }}
+        run: |
+          set -eux
+          : > /tmp/setenv
+          make_zstd_static_from_source () {
+            ZSTD_VER=v1.5.6
+            git clone --depth=1 --branch "${ZSTD_VER}" https://github.com/facebook/zstd.git
+            cmake -S zstd/build/cmake -B zstd_build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_STATIC=ON \
+              -DZSTD_LEGACY_SUPPORT=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+              -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/deps/zstd"
+            cmake --build zstd_build -j
+            cmake --install zstd_build
+            echo "ZSTD_INCLUDE_DIR=$GITHUB_WORKSPACE/deps/zstd/include" | tee -a /tmp/setenv >> $GITHUB_ENV
+            echo "ZSTD_LIBRARY=$GITHUB_WORKSPACE/deps/zstd/lib/libzstd.a" | tee -a /tmp/setenv >> $GITHUB_ENV
+          }
+          if [ "${ZSTD_FROM_SOURCE}" = "true" ]; then
+            make_zstd_static_from_source
+          else
+            if [ -f /usr/include/zstd.h ]; then
+              echo "ZSTD_INCLUDE_DIR=/usr/include" | tee -a /tmp/setenv >> $GITHUB_ENV
+              echo "ZSTD_LIBRARY=/usr/lib/$(uname -m)-linux-gnu/libzstd.a" | tee -a /tmp/setenv >> $GITHUB_ENV
+            else
+              make_zstd_static_from_source
+            fi
+          fi
+      - name: Configure & Build (arm64)
+        run: |
+          set -eux
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+            -DZSTD_INCLUDE_DIR="$ZSTD_INCLUDE_DIR" -DZSTD_LIBRARY="$ZSTD_LIBRARY"
+          cmake --build build -j
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: calcprime-${{ matrix.artifact_suffix }}-${{ matrix.label }}
+          path: build/prime-sieve*
+          if-no-files-found: warn
+
+  # =========================
+  # macOS（在 Apple Silicon 上同时产出 arm64 / x86_64）
+  # =========================
+  macos:
+    name: macOS (${{ matrix.arch }})
+    runs-on: macos-14   # Apple Silicon（推荐）。macOS 13 Intel 将退役。6
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          set -eux
+          brew update
+          brew install cmake ninja pkg-config ccache
+      - name: Build zstd (static, PIC) for ${{ matrix.arch }}
+        run: |
+          set -eux
+          ZSTD_VER=v1.5.6
+          git clone --depth=1 --branch "${ZSTD_VER}" https://github.com/facebook/zstd.git
+          cmake -S zstd/build/cmake -B zstd_build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_STATIC=ON \
+            -DZSTD_LEGACY_SUPPORT=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/deps/zstd-${{ matrix.arch }}"
+          cmake --build zstd_build -j
+          cmake --install zstd_build
+          echo "ZSTD_INCLUDE_DIR=$GITHUB_WORKSPACE/deps/zstd-${{ matrix.arch }}/include" >> $GITHUB_ENV
+          echo "ZSTD_LIBRARY=$GITHUB_WORKSPACE/deps/zstd-${{ matrix.arch }}/lib/libzstd.a" >> $GITHUB_ENV
+      - name: Configure & Build (${{ matrix.arch }})
+        run: |
+          set -eux
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DZSTD_INCLUDE_DIR="$ZSTD_INCLUDE_DIR" -DZSTD_LIBRARY="$ZSTD_LIBRARY"
+          cmake --build build -j
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: calcprime-macos-${{ matrix.arch }}
+          path: build/prime-sieve*
+          if-no-files-found: warn
+
+  # =========================
+  # Windows x64（No-AVX 守门）
+  # =========================
+  windows_x64_noavx:
+    name: Windows x64 (no-AVX)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build zstd (static) x64
+        shell: pwsh
+        run: |
+          $ZSTD_VER="v1.5.6"
+          git clone --depth=1 --branch $ZSTD_VER https://github.com/facebook/zstd.git
+          cmake -S zstd/build/cmake -B zstd_build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=${{ env.CMAKE_BUILD_TYPE }} `
+            -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_STATIC=ON -DZSTD_LEGACY_SUPPORT=OFF `
+            -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE\deps\zstd-x64"
+          cmake --build zstd_build --config Release -- /m
+          cmake --install zstd_build --config Release
+          "ZSTD_INCLUDE_DIR=$env:GITHUB_WORKSPACE\deps\zstd-x64\include" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ZSTD_LIBRARY=$env:GITHUB_WORKSPACE\deps\zstd-x64\lib\libzstd_static.lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Configure & Build (x64)
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=${{ env.CMAKE_BUILD_TYPE }} `
+            -DZSTD_INCLUDE_DIR="$env:ZSTD_INCLUDE_DIR" -DZSTD_LIBRARY="$env:ZSTD_LIBRARY"
+          cmake --build build --config Release -- /m | Tee-Object -FilePath buildlog.txt
+      - name: Guard: fail if any AVX flags appear
+        shell: pwsh
+        run: |
+          if (Select-String -Pattern "/arch:AVX" -Path buildlog.txt) {
+            Write-Host "Found AVX flags in MSVC build. Failing."; exit 1
+          }
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: calcprime-windows-x64-noavx
+          path: build\*\Release\*
+
+  # =========================
+  # Windows ARM64（公共仓库 = 原生 runner；私有仓库 = 交叉构建）
+  # =========================
+  windows_arm64_native:
+    name: Windows ARM64 (native runner)
+    if: ${{ github.event.repository.private == false }}
+    runs-on: windows-11-arm  # 公共仓库可用的官方标签。7
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build zstd (ARM64)
+        shell: pwsh
+        run: |
+          $ZSTD_VER="v1.5.6"
+          git clone --depth=1 --branch $ZSTD_VER https://github.com/facebook/zstd.git
+          cmake -S zstd/build/cmake -B zstd_build -G "Visual Studio 17 2022" -A ARM64 `
+            -DCMAKE_BUILD_TYPE=${{ env.CMAKE_BUILD_TYPE }} `
+            -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_STATIC=ON -DZSTD_LEGACY_SUPPORT=OFF `
+            -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE\deps\zstd-arm64"
+          cmake --build zstd_build --config Release -- /m
+          cmake --install zstd_build --config Release
+          "ZSTD_INCLUDE_DIR=$env:GITHUB_WORKSPACE\deps\zstd-arm64\include" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ZSTD_LIBRARY=$env:GITHUB_WORKSPACE\deps\zstd-arm64\lib\libzstd_static.lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Configure & Build (ARM64)
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A ARM64 `
+            -DCMAKE_BUILD_TYPE=${{ env.CMAKE_BUILD_TYPE }} `
+            -DZSTD_INCLUDE_DIR="$env:ZSTD_INCLUDE_DIR" -DZSTD_LIBRARY="$env:ZSTD_LIBRARY"
+          cmake --build build --config Release -- /m
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: calcprime-windows-arm64
+          path: build\*\Release\*
+
+  windows_arm64_cross:
+    name: Windows ARM64 (cross on x64 runner)
+    if: ${{ github.event.repository.private == true }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build zstd (ARM64)
+        shell: pwsh
+        run: |
+          $ZSTD_VER="v1.5.6"
+          git clone --depth=1 --branch $ZSTD_VER https://github.com/facebook/zstd.git
+          cmake -S zstd/build/cmake -B zstd_build -G "Visual Studio 17 2022" -A ARM64 `
+            -DCMAKE_BUILD_TYPE=${{ env.CMAKE_BUILD_TYPE }} `
+            -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_STATIC=ON -DZSTD_LEGACY_SUPPORT=OFF `
+            -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE\deps\zstd-arm64"
+          cmake --build zstd_build --config Release -- /m
+          cmake --install zstd_build --config Release
+          "ZSTD_INCLUDE_DIR=$env:GITHUB_WORKSPACE\deps\zstd-arm64\include" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ZSTD_LIBRARY=$env:GITHUB_WORKSPACE\deps\zstd-arm64\lib\libzstd_static.lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Configure & Build (ARM64)
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A ARM64 `
+            -DCMAKE_BUILD_TYPE=${{ env.CMAKE_BUILD_TYPE }} `
+            -DZSTD_INCLUDE_DIR="$env:ZSTD_INCLUDE_DIR" -DZSTD_LIBRARY="$env:ZSTD_LIBRARY"
+          cmake --build build --config Release -- /m
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: calcprime-windows-arm64
+          path: build\*\Release\*
+
+  # =========================
+  # 可选发布：只有传入 tag 才会执行
+  # =========================
+  release:
+    if: ${{ inputs.tag != '' }}
+    needs:
+      - linux
+      - linux_noavx
+      - linux_arm64
+      - macos
+      - windows_x64_noavx
+      - windows_arm64_native
+      - windows_arm64_cross
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          files: |
+            dist/**/*
