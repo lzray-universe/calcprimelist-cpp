@@ -524,7 +524,7 @@ Relevant code: `prime_count.*`
 > Windows equivalent: `.\prime-sieve.exe --to {N} --count --time`.
 > Note: `--time` uses the tool’s internal timing (µs); if unavailable, wall-clock is used. Absolute values depend on CPU/RAM/OS/compiler.
 
-**Test data (10 runs per point):** (table from `Intel® Core™ Ultra 7 265K`)
+**Test data (10 runs per point):** (table from `Intel® Core™ Ultra 7 265K @ P 3.90 / E 3.30 GHz · 20C/20T (8P+12E)` `Microsoft Windows 11 Pro for Workstations, Version 25H2 (OS Build 26220.7052), x64`)
 
 |     N (`--to`) | runs | ok | best (s) | median (s) | mean (s) | throughput median (range/s) |
 | -------------: | ---: | -: | -------: | ---------: | -------: | --------------------------: |
