@@ -532,7 +532,7 @@ int main() {
 > Windows 等价命令：`.\prime-sieve.exe --to {N} --count --time`。
 > 注：`--time` 为工具内计时（微秒），若不可用则以外部 wall-clock 计时。具体环境（CPU/内存/OS/编译器）会影响绝对值。
 
-**测试数据（10 次/每点）：**（本表来自 `Intel® Core™ Ultra 7 265K`）
+**测试数据（10 次/每点）：**（本表来自 `Intel® Core™ Ultra 7 265K @ P 3.90 / E 3.30 GHz · 20C/20T (8P+12E)` `Microsoft Windows 11 Pro for Workstations, Version 25H2 (OS Build 26220.7052), x64`）
 
 |     N (`--to`) | runs | ok | best (s) | median (s) | mean (s) | throughput median (range/s) |
 | -------------: | ---: | -: | -------: | ---------: | -------: | --------------------------: |
