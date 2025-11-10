@@ -5,6 +5,7 @@
 
 namespace calcprime {
 
-std::vector<std::uint32_t>simple_sieve(std::uint64_t limit);
+std::vector<std::uint32_t> simple_sieve(std::uint64_t limit);
 
-}
+} // namespace calcprime
+

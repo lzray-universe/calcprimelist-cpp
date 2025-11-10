@@ -5,19 +5,6 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_path(ZSTD_INCLUDE_DIR NAMES zstd.h)
-find_library(ZSTD_LIBRARY NAMES zstd)
-
-if(NOT ZSTD_INCLUDE_DIR OR NOT ZSTD_LIBRARY)
-    message(FATAL_ERROR "Failed to locate zstd headers or library")
-endif()
-
-add_library(ZSTD::ZSTD UNKNOWN IMPORTED)
-set_target_properties(ZSTD::ZSTD PROPERTIES
-    IMPORTED_LOCATION "${ZSTD_LIBRARY}"
-    INTERFACE_INCLUDE_DIRECTORIES "${ZSTD_INCLUDE_DIR}"
-)
-
 set(CALCPRIME_SOURCES
     src/cpu_info.cpp
     src/wheel.cpp
@@ -34,7 +21,6 @@ function(calcprime_configure_library target)
     target_include_directories(${target} PUBLIC include)
     target_compile_definitions(${target} PRIVATE _USE_MATH_DEFINES)
     set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_link_libraries(${target} PUBLIC ZSTD::ZSTD)
 
     if(MSVC)
         target_compile_options(${target} PRIVATE /arch:AVX2 /W4)
@@ -82,3 +68,4 @@ add_test(NAME prime_sieve_scientific_to_100k
     COMMAND $<TARGET_FILE:prime-sieve> --to 1e5 --count --time)
 set_tests_properties(prime_sieve_scientific_to_100k
     PROPERTIES PASS_REGULAR_EXPRESSION "9592;Elapsed: [0-9]+ us")
+

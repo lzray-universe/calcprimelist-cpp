@@ -17,6 +17,7 @@ struct CpuInfo {
 
 CpuInfo detect_cpu_info();
 
-unsigned effective_thread_count(const CpuInfo&info);
+unsigned effective_thread_count(const CpuInfo &info);
 
-}
+} // namespace calcprime
+
