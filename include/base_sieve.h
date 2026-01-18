@@ -1,11 +1,10 @@
 #pragma once
 
-#include <cstdint>
-#include <vector>
+#include<cstdint>
+#include<vector>
 
-namespace calcprime {
+namespace calcprime{
 
 std::vector<std::uint32_t> simple_sieve(std::uint64_t limit);
 
 } // namespace calcprime
-
