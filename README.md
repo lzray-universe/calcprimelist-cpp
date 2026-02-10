@@ -2,6 +2,9 @@
 # calcprimelist
 [![License: MIT](https://img.shields.io/badge/License-MIT-2ea44f)](./LICENSE)© 2025 lzray
 
+[![Lines of Code](https://img.shields.io/endpoint?url=https%3A%2F%2Ftokei.kojix2.net%2Fbadge%2Fgithub%2Flzray-universe%2Fcalcprimelist-cpp%2Flines)](https://tokei.kojix2.net/github/lzray-universe/calcprimelist-cpp)
+
+[![Top Language](https://img.shields.io/endpoint?url=https%3A%2F%2Ftokei.kojix2.net%2Fbadge%2Fgithub%2Flzray-universe%2Fcalcprimelist-cpp%2Flanguage)](https://tokei.kojix2.net/github/lzray-universe/calcprimelist-cpp)
 
 English README: [![English](https://img.shields.io/badge/lang-English-informational)](README_ENG.md)
 
