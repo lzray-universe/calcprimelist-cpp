@@ -120,3 +120,13 @@ add_test(NAME prime_sieve_scientific_to_100k
     COMMAND $<TARGET_FILE:prime-sieve> --to 1e5 --count --time)
 set_tests_properties(prime_sieve_scientific_to_100k
     PROPERTIES PASS_REGULAR_EXPRESSION "9592;Elapsed: [0-9]+ us")
+
+add_test(NAME prime_sieve_hex_to_0x1e5_count
+    COMMAND $<TARGET_FILE:prime-sieve> --to 0x1e5 --count)
+set_tests_properties(prime_sieve_hex_to_0x1e5_count
+    PROPERTIES PASS_REGULAR_EXPRESSION "(^|[^0-9])92([^0-9]|$)")
+
+add_test(NAME prime_sieve_even_only_range_count
+    COMMAND $<TARGET_FILE:prime-sieve> --from 8 --to 9 --count)
+set_tests_properties(prime_sieve_even_only_range_count
+    PROPERTIES PASS_REGULAR_EXPRESSION "(^|[^0-9])0([^0-9]|$)")

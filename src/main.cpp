@@ -7,10 +7,12 @@
 #include "wheel.h"
 #include "writer.h"
 
+#include<bit>
 #include<algorithm>
 #include<atomic>
 #include<chrono>
 #include<cinttypes>
+#include<cctype>
 #include<cmath>
 #include<condition_variable>
 #include<cstddef>
@@ -55,18 +57,24 @@ std::uint64_t parse_u64(const std::string&value){
 		throw std::invalid_argument("invalid integer: "+value);
 	}
 
-	auto exp_pos=value.find_first_of("eE");
+	bool has_hex_prefix=value.size()>=2&&value[0]=='0'&&
+						(value[1]=='x'||value[1]=='X');
+	auto exp_pos=has_hex_prefix?std::string::npos:value.find_first_of("eE");
 	if(exp_pos!=std::string::npos){
 		std::string mantissa_str=value.substr(0,exp_pos);
 		std::string exponent_str=value.substr(exp_pos+1);
 		if(mantissa_str.empty()||exponent_str.empty()){
 			throw std::invalid_argument("invalid integer: "+value);
 		}
+		if(!std::all_of(mantissa_str.begin(),mantissa_str.end(),
+						[](unsigned char ch){ return std::isdigit(ch)!=0; })){
+			throw std::invalid_argument("invalid integer: "+value);
+		}
 
 		std::size_t mantissa_idx=0;
 		std::uint64_t mantissa=0;
 		try{
-			mantissa=std::stoull(mantissa_str,&mantissa_idx,0);
+			mantissa=std::stoull(mantissa_str,&mantissa_idx,10);
 		}catch(const std::exception&){
 			throw std::invalid_argument("invalid integer: "+value);
 		}
@@ -86,6 +94,12 @@ std::uint64_t parse_u64(const std::string&value){
 		}
 		if(exponent<0){
 			throw std::invalid_argument("invalid integer: "+value);
+		}
+		if(mantissa==0){
+			return 0;
+		}
+		if(exponent>19){
+			throw std::invalid_argument("integer too large: "+value);
 		}
 
 		std::uint64_t result=mantissa;
@@ -117,7 +131,7 @@ std::size_t parse_size(const std::string&value){
 	}
 	std::size_t idx=0;
 	std::uint64_t base=std::stoull(value,&idx,0);
-	std::size_t factor=1;
+	std::uint64_t factor=1;
 	if(idx<value.size()){
 		char suffix=value[idx];
 		switch(suffix){
@@ -143,12 +157,41 @@ std::size_t parse_size(const std::string&value){
 	if(idx!=value.size()){
 		throw std::invalid_argument("invalid size suffix: "+value);
 	}
+	if(base>std::numeric_limits<std::uint64_t>::max()/factor){
+		throw std::invalid_argument("size too large: "+value);
+	}
 	std::uint64_t result=base*factor;
 	if(result>
 	   static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())){
 		throw std::invalid_argument("size too large: "+value);
 	}
 	return static_cast<std::size_t>(result);
+}
+
+static void extract_segment_primes(const std::vector<std::uint64_t>&bitset,
+								   std::uint64_t seg_low,
+								   std::size_t bit_count,
+								   std::vector<std::uint64_t>&primes){
+	std::size_t remaining=bit_count;
+	for(std::size_t word=0;word<bitset.size()&&remaining>0;++word){
+		std::uint64_t valid_mask=std::numeric_limits<std::uint64_t>::max();
+		if(remaining<64){
+			valid_mask=(1ULL<<remaining)-1ULL;
+		}
+		std::uint64_t prime_bits=(~bitset[word])&valid_mask;
+		while(prime_bits){
+			unsigned bit=std::countr_zero(prime_bits);
+			std::uint64_t index=(static_cast<std::uint64_t>(word)<<6)+
+								static_cast<std::uint64_t>(bit);
+			primes.push_back(seg_low+(index<<1));
+			prime_bits&=(prime_bits-1);
+		}
+		if(remaining>=64){
+			remaining-=64;
+		}else{
+			remaining=0;
+		}
+	}
 }
 
 void parse_output_format(Options&opts,const std::string&fmt){
@@ -330,14 +373,11 @@ int run_cli(int argc,char**argv){
 		if((odd_begin&1ULL)==0){
 			++odd_begin;
 		}
-		if(odd_begin>=opts.to){
-			odd_begin=3;
-		}
 		std::uint64_t odd_end=opts.to;
 		if((odd_end&1ULL)==0){
 			++odd_end;
 		}
-		if(odd_end<=odd_begin){
+		if(odd_begin>=opts.to||odd_end<=odd_begin){
 			odd_end=odd_begin;
 		}
 
@@ -476,19 +516,7 @@ int run_cli(int argc,char**argv){
 					if(need_primes&&segment_id<segment_results.size()){
 						std::vector<std::uint64_t> primes;
 						primes.reserve(static_cast<std::size_t>(local_count));
-						std::uint64_t value=seg_low;
-						std::size_t produced=0;
-						for(std::size_t word=0;
-							word<bitset.size()&&produced<bit_count;++word){
-							std::uint64_t composite=bitset[word];
-							for(std::size_t bit=0;bit<64&&produced<bit_count;
-								++bit,++produced,value+=2){
-								if(composite&(1ULL<<bit)){
-									continue;
-								}
-								primes.push_back(value);
-							}
-						}
+						extract_segment_primes(bitset,seg_low,bit_count,primes);
 						segment_results[segment_id].primes=std::move(primes);
 						{
 							std::lock_guard<std::mutex> lock(
@@ -496,7 +524,7 @@ int run_cli(int argc,char**argv){
 							segment_results[segment_id].ready.store(
 								true,std::memory_order_release);
 						}
-						segment_ready_cv.notify_all();
+						segment_ready_cv.notify_one();
 						if(opts.nth.has_value()&&threads==1&&
 						   !nth_found.load(std::memory_order_relaxed)){
 							std::uint64_t base=cumulative;
@@ -525,21 +553,8 @@ int run_cli(int argc,char**argv){
 								std::vector<std::uint64_t> primes;
 								primes.reserve(
 									static_cast<std::size_t>(local_count));
-								std::uint64_t value=seg_low;
-								std::size_t produced=0;
-								for(std::size_t word=0;
-									word<bitset.size()&&produced<bit_count;
-									++word){
-									std::uint64_t composite=bitset[word];
-									for(std::size_t bit=0;
-										bit<64&&produced<bit_count;
-										++bit,++produced,value+=2){
-										if(composite&(1ULL<<bit)){
-											continue;
-										}
-										primes.push_back(value);
-									}
-								}
+								extract_segment_primes(bitset,seg_low,bit_count,
+													   primes);
 								std::size_t index=
 									static_cast<std::size_t>(nth_target-base-1);
 								if(index<primes.size()){
@@ -557,7 +572,7 @@ int run_cli(int argc,char**argv){
 										segment_results[segment_id].ready.store(
 											true,std::memory_order_release);
 									}
-									segment_ready_cv.notify_all();
+									segment_ready_cv.notify_one();
 								}
 							}
 							cumulative=new_total;
@@ -595,6 +610,8 @@ int run_cli(int argc,char**argv){
 					std::lock_guard<std::mutex> err_lock(
 						writer_exception_mutex);
 					writer_exception=std::current_exception();
+					stop.store(true,std::memory_order_relaxed);
+					segment_ready_cv.notify_all();
 				}
 			});
 		}
