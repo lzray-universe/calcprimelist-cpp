@@ -48,7 +48,8 @@ typedef enum calcprime_wheel_type{
 typedef enum calcprime_output_format{
 	CALCPRIME_OUTPUT_TEXT=0,
 	CALCPRIME_OUTPUT_BINARY=1,
-	CALCPRIME_OUTPUT_ZSTD_DELTA=2
+	CALCPRIME_OUTPUT_DELTA16=2,
+	CALCPRIME_OUTPUT_ZSTD_DELTA=CALCPRIME_OUTPUT_DELTA16
 } calcprime_output_format;
 
 struct calcprime_cancel_token;
@@ -77,6 +78,7 @@ typedef struct calcprime_range_options{
 	calcprime_progress_callback progress_callback;
 	void*progress_user_data;
 	calcprime_cancel_token*cancel_token;
+	int compress_zstd;
 } calcprime_range_options;
 
 typedef struct calcprime_range_stats{

@@ -38,7 +38,7 @@ bool is_valid_output_format(calcprime_output_format format){
 	switch(format){
 	case CALCPRIME_OUTPUT_TEXT:
 	case CALCPRIME_OUTPUT_BINARY:
-	case CALCPRIME_OUTPUT_ZSTD_DELTA:
+	case CALCPRIME_OUTPUT_DELTA16:
 		return true;
 	}
 	return false;
@@ -62,8 +62,8 @@ calcprime::PrimeOutputFormat to_cpp_output(calcprime_output_format format){
 		return calcprime::PrimeOutputFormat::Text;
 	case CALCPRIME_OUTPUT_BINARY:
 		return calcprime::PrimeOutputFormat::Binary;
-	case CALCPRIME_OUTPUT_ZSTD_DELTA:
-		return calcprime::PrimeOutputFormat::ZstdDelta;
+	case CALCPRIME_OUTPUT_DELTA16:
+		return calcprime::PrimeOutputFormat::Delta16;
 	}
 	return calcprime::PrimeOutputFormat::Text;
 }
@@ -86,8 +86,8 @@ calcprime_output_format to_c_output(calcprime::PrimeOutputFormat format){
 		return CALCPRIME_OUTPUT_TEXT;
 	case calcprime::PrimeOutputFormat::Binary:
 		return CALCPRIME_OUTPUT_BINARY;
-	case calcprime::PrimeOutputFormat::ZstdDelta:
-		return CALCPRIME_OUTPUT_ZSTD_DELTA;
+	case calcprime::PrimeOutputFormat::Delta16:
+		return CALCPRIME_OUTPUT_DELTA16;
 	}
 	return CALCPRIME_OUTPUT_TEXT;
 }
@@ -132,6 +132,7 @@ struct RangeOptions{
 	bool collect_primes=false;
 	bool use_meissel=false;
 	bool write_to_file=false;
+	bool compress_zstd=false;
 	calcprime::PrimeOutputFormat output_format=
 		calcprime::PrimeOutputFormat::Text;
 	std::string output_path;
@@ -154,6 +155,7 @@ RangeOptions make_range_options(const calcprime_range_options&opts){
 	result.collect_primes=opts.collect_primes!=0;
 	result.use_meissel=opts.use_meissel!=0;
 	result.write_to_file=opts.write_to_file!=0;
+	result.compress_zstd=opts.compress_zstd!=0;
 	result.output_format=to_cpp_output(opts.output_format);
 	if(opts.output_path){
 		result.output_path=opts.output_path;
@@ -322,6 +324,7 @@ extern "C" int calcprime_range_options_init(calcprime_range_options*options){
 	options->progress_callback=nullptr;
 	options->progress_user_data=nullptr;
 	options->cancel_token=nullptr;
+	options->compress_zstd=0;
 	return 0;
 }
 
@@ -398,6 +401,13 @@ calcprime_run_range(const calcprime_range_options*options,
 	}
 
 	RangeOptions opts=make_range_options(*options);
+#if !defined(CALCPRIME_HAS_ZSTD)
+	if(opts.compress_zstd){
+		result->error_message="zstd not supported in this build";
+		*out_result=result.release();
+		return CALCPRIME_STATUS_INVALID_ARGUMENT;
+	}
+#endif
 
 	result->status=CALCPRIME_STATUS_SUCCESS;
 	result->stats.from=opts.from;
@@ -407,7 +417,7 @@ calcprime_run_range(const calcprime_range_options*options,
 	result->stats.cpu=calcprime_cpu_info{};
 	result->stats.segment=calcprime_segment_config{};
 	result->stats.wheel=options->wheel;
-	result->stats.output_format=options->output_format;
+	result->stats.output_format=to_c_output(opts.output_format);
 	result->stats.segments_total=0;
 	result->stats.segments_processed=0;
 	result->stats.prime_count=0;
@@ -575,7 +585,7 @@ calcprime_run_range(const calcprime_range_options*options,
 	if(opts.write_to_file){
 		try{
 			writer=std::make_unique<calcprime::PrimeWriter>(
-				true,opts.output_path,opts.output_format);
+				true,opts.output_path,opts.output_format,opts.compress_zstd);
 		}catch(const std::exception&ex){
 			result->status=CALCPRIME_STATUS_IO_ERROR;
 			result->error_message=ex.what();

@@ -16,6 +16,7 @@
 #include<cstddef>
 #include<cstdint>
 #include<exception>
+#include<cstdio>
 #include<iomanip>
 #include<iostream>
 #include<limits>
@@ -41,6 +42,7 @@ struct Options{
 	std::size_t tile_bytes=0;
 	std::string output_path;
 	PrimeOutputFormat output_format=PrimeOutputFormat::Text;
+	bool use_zstd=false;
 	bool show_time=false;
 	bool show_stats=false;
 	bool use_ml=false;
@@ -149,6 +151,25 @@ std::size_t parse_size(const std::string&value){
 	return static_cast<std::size_t>(result);
 }
 
+void parse_output_format(Options&opts,const std::string&fmt){
+	if(fmt=="text"){
+		opts.output_format=PrimeOutputFormat::Text;
+	}else if(fmt=="binary"){
+		opts.output_format=PrimeOutputFormat::Binary;
+	}else if(fmt=="delta16"){
+		opts.output_format=PrimeOutputFormat::Delta16;
+	}else if(fmt=="zstd"||fmt=="zstd+delta"){
+		opts.output_format=PrimeOutputFormat::Delta16;
+		opts.use_zstd=true;
+		std::fprintf(stderr,
+					 "[calcprime] warning: --out-format=%s is deprecated; "
+					 "use --out-format=delta16 --zstd.\n",
+					 fmt.c_str());
+	}else{
+		throw std::invalid_argument("unsupported out-format: "+fmt);
+	}
+}
+
 Options parse_options(int argc,char**argv){
 	Options opts;
 	for(int i=1;i<argc;++i){
@@ -159,16 +180,7 @@ Options parse_options(int argc,char**argv){
 			opts.help=true;
 			return opts;
 		}else if(arg.rfind(out_format_prefix,0)==0){
-			std::string fmt=arg.substr(out_format_prefix.size());
-			if(fmt=="text"){
-				opts.output_format=PrimeOutputFormat::Text;
-			}else if(fmt=="binary"){
-				opts.output_format=PrimeOutputFormat::Binary;
-			}else if(fmt=="zstd"||fmt=="zstd+delta"){
-				opts.output_format=PrimeOutputFormat::ZstdDelta;
-			}else{
-				throw std::invalid_argument("unsupported out-format: "+fmt);
-			}
+			parse_output_format(opts,arg.substr(out_format_prefix.size()));
 		}else if(arg=="--from"){
 			if(i+1>=argc){
 				throw std::invalid_argument("--from requires a value");
@@ -229,16 +241,9 @@ Options parse_options(int argc,char**argv){
 			if(i+1>=argc){
 				throw std::invalid_argument("--out-format requires a value");
 			}
-			std::string fmt=argv[++i];
-			if(fmt=="text"){
-				opts.output_format=PrimeOutputFormat::Text;
-			}else if(fmt=="binary"){
-				opts.output_format=PrimeOutputFormat::Binary;
-			}else if(fmt=="zstd"||fmt=="zstd+delta"){
-				opts.output_format=PrimeOutputFormat::ZstdDelta;
-			}else{
-				throw std::invalid_argument("unsupported out-format: "+fmt);
-			}
+			parse_output_format(opts,argv[++i]);
+		}else if(arg=="--zstd"){
+			opts.use_zstd=true;
 		}else if(arg=="--time"){
 			opts.show_time=true;
 		}else if(arg=="--stats"){
@@ -268,7 +273,9 @@ void print_usage(){
 		<<"  --segment BYTES     Override segment size\n"
 		<<"  --tile BYTES        Override tile size\n"
 		<<"  --out PATH          Write primes to file\n"
-		<<"  --out-format FMT    Output format: text (default), binary, zstd\n"
+		<<"  --out-format FMT    Output format: text (default), binary, delta16\n"
+		<<"                    Deprecated aliases: zstd, zstd+delta\n"
+		<<"  --zstd              Compress output stream with zstd (if supported)\n"
 		<<"  --time              Print elapsed time\n"
 		<<"  --stats             Print configuration statistics\n"
 		<<"  --ml                Use Meissel-Lehmer counting for --count\n"
@@ -288,6 +295,11 @@ int run_cli(int argc,char**argv){
 			print_usage();
 			return 0;
 		}
+#if !defined(CALCPRIME_HAS_ZSTD)
+		if(opts.use_zstd){
+			throw std::invalid_argument("zstd not supported in this build");
+		}
+#endif
 		if(opts.test_value.has_value()&&!opts.has_to){
 			bool is_prime=miller_rabin_is_prime(opts.test_value.value());
 			std::cout<<(is_prime?"prime":"composite")<<"\n";
@@ -433,7 +445,7 @@ int run_cli(int argc,char**argv){
 		}
 
 		PrimeWriter writer(opts.print_primes,opts.output_path,
-						   opts.output_format);
+						   opts.output_format,opts.use_zstd);
 		std::mutex writer_exception_mutex;
 		std::exception_ptr writer_exception;
 		std::thread writer_feeder;

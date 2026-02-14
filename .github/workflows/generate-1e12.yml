@@ -174,7 +174,7 @@ jobs:
             ./build/prime-sieve --from "$FROM" --to "$TO_EXCL" --print \
               --out "$OUTDIR/primes_${NAME}.bin" --out-format binary
             ./build/prime-sieve --from "$FROM" --to "$TO_EXCL" --print \
-              --out "$OUTDIR/primes_${NAME}.zst" --out-format zstd
+              --out "$OUTDIR/primes_${NAME}.zst" --out-format delta16 --zstd
 
             ( cd "$OUTDIR" && \
               zip -m -j "primes_${NAME}.txt.zip" "primes_${NAME}.txt" && \
@@ -256,7 +256,7 @@ jobs:
             ./build/prime-sieve --from "$FROM" --to "$TO_EXCL" --print \
               --out "$OUTDIR/primes_${NAME}.bin" --out-format binary
             ./build/prime-sieve --from "$FROM" --to "$TO_EXCL" --print \
-              --out "$OUTDIR/primes_${NAME}.zst" --out-format zstd
+              --out "$OUTDIR/primes_${NAME}.zst" --out-format delta16 --zstd
 
             ( cd "$OUTDIR" && \
               zip -m -j "primes_${NAME}.txt.zip" "primes_${NAME}.txt" && \

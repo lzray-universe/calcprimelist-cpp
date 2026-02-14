@@ -15,7 +15,7 @@ English README: [![English](https://img.shields.io/badge/lang-English-informatio
 * 区间计数 `π(B)−π(A)`、区间打印、区间内第 *K* 个素数
 * 轮因子（wheel）预筛：`mod 30 / 210 / 1155`
 * 自动依据 CPU 缓存与线程数选取分段/分块尺寸
-* 二进制与（可选）Zstd+Δ 编码输出
+* 三种基础输出（`text` / `binary` / `delta16`）与可选 Zstd 压缩
 * Meissel–Lehmer 质数计数
 * Miller–Rabin 素性测试
 * C++ 静态库、跨语言 C ABI（DLL/.so）调用
@@ -40,7 +40,7 @@ English README: [![English](https://img.shields.io/badge/lang-English-informatio
 
 ### 编译
 
-依赖：CMake ≥ 3.16、C++20 编译器（GCC/Clang/MSVC）、**Zstd 开发包（≥ 1.5）**
+依赖：CMake ≥ 3.16、C++20 编译器（GCC/Clang/MSVC）；**Zstd 开发包是可选依赖**（仅在启用 `--zstd` 时需要）
 
 安装 Zstd（任选其一）：
 - Ubuntu / Debian：`sudo apt-get install -y libzstd-dev`
@@ -52,14 +52,14 @@ English README: [![English](https://img.shields.io/badge/lang-English-informatio
     - CMake：`-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake`
   - 或手工下载预编译包，并在 CMake 配置时显式指定路径（见下）
 
-若 CMake 未能自动找到头文件/库，可显式传入：
+若要启用 Zstd 且 CMake 未能自动找到头文件/库，可显式传入：
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DZSTD_INCLUDE_DIR=/path/to/include \
   -DZSTD_LIBRARY=/path/to/libzstd.{a,so,dylib,lib}
 ````
 
-> 常见错误：`Failed to locate zstd headers or library` —— 请按上面安装开发包，或用 `-DZSTD_INCLUDE_DIR/-DZSTD_LIBRARY` 指定路径。
+> 若未安装 Zstd，项目仍可正常构建（仅禁用 `--zstd` 功能）。
 
 ```bash
 # Linux / macOS
@@ -96,8 +96,8 @@ cmake --build build --config Release
 # 保存到文件（二进制 little-endian uint64）
 ./build/prime-sieve --to 1000000 --print --out primes.bin --out-format binary
 
-# 保存到文件（Zstd + Δ；更省空间/带宽）
-./build/prime-sieve --to 10000000 --print --out primes.zst --out-format zstd
+# 保存到文件（delta16 + Zstd；更省空间/带宽）
+./build/prime-sieve --to 10000000 --print --out primes.zst --out-format delta16 --zstd
 ```
 
 > 支持科学计数法与大小后缀：`--to 1e8`、`--segment 1M`、`--tile 256K` 等。
@@ -122,7 +122,8 @@ prime-sieve --from A --to B [options]
 
   输出与统计：
   --out PATH          将输出写入文件（默认 stdout）
-  --out-format FMT    text（默认）| binary | zstd
+  --out-format FMT    text（默认）| binary | delta16
+  --zstd              对输出字节流做 zstd 压缩（若构建支持）
   --time              打印耗时（微秒）
   --stats             打印配置统计（线程、缓存、分段等）
 
@@ -140,8 +141,8 @@ prime-sieve --from A --to B [options]
 # 期望输出（示例）：78498
 # Elapsed: 123456 us
 
-# 2) 打印并压缩（Zstd+Δ）
-./prime-sieve --from 1 --to 1e7 --print --out primes.zst --out-format zstd
+# 2) 打印并压缩（delta16 + Zstd）
+./prime-sieve --from 1 --to 1e7 --print --out primes.zst --out-format delta16 --zstd
 
 # 3) 在大区间内找第 1e5 个素数（建议单线程以降低内存占用峰值）
 ./prime-sieve --from 1 --to 1e8 --nth 100000 --threads 1 --time
@@ -174,13 +175,17 @@ prime-sieve --from A --to B [options]
           primes.append(x)
   ```
 
-### `zstd`（Zstd+Δ）
+### `delta16`
 
-* 按值递增顺序对素数做**差分（Δ）编码**，再以 Zstd 压缩（实现中名为 `ZstdDelta`）。
-* 解码思路：Zstd 解压得到 `uint64_t` 小端的差分序列，再前缀和还原。
-* 适合**大规模**导出（带宽/存储友好）。
+* 开头写第一个素数（`uint64_t` little-endian）。
+* 从第二个素数开始，每个值写为与前一个素数的差（`int16_t` little-endian，正数）。
+* 若差值超过 `INT16_MAX`，会直接报错（不使用逃逸码/变长编码）。
 
-> 说明：仓库中 `writer` 模块对 Δ 编码做了封装；Zstd 压缩是否启用取决于编译配置/环境。若计划长期归档建议 `--out-format zstd`。
+### `--zstd`（可选压缩开关）
+
+* `--zstd` 不再是输出格式，而是对上述 `text` / `binary` / `delta16` 任一格式的字节流进行 zstd frame 流式压缩。
+* 若当前构建不支持 zstd，传入 `--zstd` 会报错：`zstd not supported in this build`。
+* 兼容别名：`--out-format zstd` 或 `--out-format zstd+delta` 等价于 `--out-format delta16 --zstd`（已弃用）。
 
 ---
 
@@ -270,7 +275,8 @@ typedef enum calcprime_wheel_type {
 typedef enum calcprime_output_format {
     CALCPRIME_OUTPUT_TEXT        = 0,
     CALCPRIME_OUTPUT_BINARY      = 1,
-    CALCPRIME_OUTPUT_ZSTD_DELTA  = 2
+    CALCPRIME_OUTPUT_DELTA16     = 2,
+    CALCPRIME_OUTPUT_ZSTD_DELTA  = CALCPRIME_OUTPUT_DELTA16 // deprecated alias
 } calcprime_output_format;
 
 struct calcprime_cancel_token;
@@ -304,6 +310,7 @@ typedef struct calcprime_range_options {
     calcprime_progress_callback     progress_callback;    // 可选：进度回调
     void*       progress_user_data;
     calcprime_cancel_token*        cancel_token;         // 可选：可取消
+    int         compress_zstd;      // 1=启用 zstd 压缩（若构建支持）
 } calcprime_range_options;
 ```
 
@@ -502,7 +509,7 @@ int main() {
 ### 5. 计数与输出
 
 * **计数**：位图就绪后调用 `count_zero_bits(bits, bit_count)`，配合 AVX2/AVX-512（如可用）的 `popcnt` 变体优化。
-* **输出**：`PrimeWriter` 维护一个 I/O 线程与**块队列**（`Chunk`），前端将编码好的文本或二进制块入队；后端顺序写文件/stdout，降低主线程 I/O 影响。`ZstdDelta` 模式下先做 Δ 编码，再进行压缩/拼装。
+* **输出**：`PrimeWriter` 维护一个 I/O 线程与**块队列**（`Chunk`），前端将 `text`/`binary`/`delta16` 编码后的块入队；后端顺序写文件/stdout，且仅在 writer 线程中按需执行 zstd 流式压缩。
 
 相关代码：`popcnt.*` / `writer.*`
 
@@ -553,7 +560,6 @@ int main() {
 * **轮因子**：`--wheel 210` 在大区间往往更快；`1155` 预筛最强，但掩码/步进表更大，小区间未必划算。
 * **分段/分块**：若清楚目标平台缓存，可手动设定 `--segment / --tile`；一般保证 **tile ≤ L1D，segment 近似 L2** 会有较好效果。
 * **寻找第 K 个素数**：若内存紧/更稳定，可用 `--threads 1`；并行情况下内部会以段计数推进，也能找到，但需要额外同步与（可能）二次扫描某些段。
-* **输出吞吐**：批量写文件时，优先 `--out-format binary` 或 `--out-format zstd`。文本输出的格式人类友好但对磁盘/带宽不友好。
+* **输出吞吐**：批量写文件时，优先 `--out-format binary`，或 `--out-format delta16 --zstd`。文本输出人类友好但对磁盘/带宽不友好。
 * **边界**：所有计算在 `uint64_t` 范围内进行；请确保 `--from/--to` 满足 `0 ≤ from < to` 且上界不溢出。内部仅标记奇数，`2` 会在前缀处理中单独考虑。
 * **测试**：`ctest` 中含有示例（如 `--to 100000 --count --time`）。
-

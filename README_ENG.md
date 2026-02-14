@@ -7,7 +7,7 @@ A parallelizable **segmented prime sieve** tool & library (C++20). It supports:
 * Interval counting `π(B) − π(A)`, printing primes in a range, and the *K*-th prime within a range
 * Wheel pre-sieving: `mod 30 / 210 / 1155`
 * Auto-tuned segment/tile sizes based on CPU cache & thread count
-* Binary output and optional Zstd + Δ encoding
+* Three base output formats (`text` / `binary` / `delta16`) with optional Zstd compression
 * Meissel–Lehmer prime counting
 * Miller–Rabin primality testing
 * C++ static library and a cross-language C ABI (DLL/.so)
@@ -30,7 +30,7 @@ A parallelizable **segmented prime sieve** tool & library (C++20). It supports:
 
 ### Build
 
-Dependencies: CMake ≥ 3.16, a C++20 compiler (GCC/Clang/MSVC), and **Zstd development files (≥ 1.5)**
+Dependencies: CMake ≥ 3.16 and a C++20 compiler (GCC/Clang/MSVC); **Zstd dev files are optional** (required only for `--zstd`)
 
 Install Zstd:
 - Ubuntu / Debian: `sudo apt-get install -y libzstd-dev`
@@ -42,14 +42,14 @@ Install Zstd:
     - CMake: `-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake`
   - or use a prebuilt package and pass paths explicitly:
 
-If auto-detection fails, pass the paths explicitly:
+If you want Zstd and auto-detection fails, pass the paths explicitly:
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DZSTD_INCLUDE_DIR=/path/to/include \
   -DZSTD_LIBRARY=/path/to/libzstd.{a,so,dylib,lib}
 ````
 
-> Common error: `Failed to locate zstd headers or library` — install Zstd dev files or provide the paths above.
+> If Zstd is not installed, the project still builds; only `--zstd` is unavailable.
 
 ```bash
 # Linux / macOS
@@ -86,8 +86,8 @@ Build targets:
 # Save to file (binary little-endian uint64)
 ./build/prime-sieve --to 1000000 --print --out primes.bin --out-format binary
 
-# Save to file (Zstd + Δ; space/bandwidth friendly)
-./build/prime-sieve --to 10000000 --print --out primes.zst --out-format zstd
+# Save to file (delta16 + Zstd; space/bandwidth friendly)
+./build/prime-sieve --to 10000000 --print --out primes.zst --out-format delta16 --zstd
 ```
 
 > Scientific notation and size suffixes are supported: `--to 1e8`, `--segment 1M`, `--tile 256K`, etc.
@@ -112,7 +112,8 @@ prime-sieve --from A --to B [options]
 
   Output & stats:
   --out PATH          Write output to file (default stdout)
-  --out-format FMT    text (default) | binary | zstd
+  --out-format FMT    text (default) | binary | delta16
+  --zstd              Apply zstd compression to output bytes (if supported)
   --time              Print elapsed time (microseconds)
   --stats             Print configuration stats (threads, cache, segments, etc.)
 
@@ -130,8 +131,8 @@ prime-sieve --from A --to B [options]
 # Expected (example): 78498
 # Elapsed: 123456 us
 
-# 2) Print and compress (Zstd + Δ)
-./prime-sieve --from 1 --to 1e7 --print --out primes.zst --out-format zstd
+# 2) Print and compress (delta16 + Zstd)
+./prime-sieve --from 1 --to 1e7 --print --out primes.zst --out-format delta16 --zstd
 
 # 3) Find the 1e5-th prime in a large interval (single-thread to reduce peak memory)
 ./prime-sieve --from 1 --to 1e8 --nth 100000 --threads 1 --time
@@ -164,13 +165,17 @@ prime-sieve --from A --to B [options]
           primes.append(x)
   ```
 
-### `zstd` (Zstd + Δ)
+### `delta16`
 
-* Primes in ascending order are **delta-encoded (Δ)**, then compressed with Zstd (implemented as `ZstdDelta`).
-* Decoding: Zstd-decompress to obtain a little-endian `uint64_t` Δ sequence; then prefix-sum to recover values.
-* Suited for **large-scale** export (bandwidth/storage friendly).
+* The first prime is written as `uint64_t` little-endian.
+* From the second prime onward, each value is written as delta-to-previous using `int16_t` little-endian (positive).
+* If a delta exceeds `INT16_MAX`, the writer throws an error directly (no escape/varint scheme).
 
-> Note: the `writer` module encapsulates Δ encoding; whether Zstd is enabled depends on build settings/environment. For long-term archiving, prefer `--out-format zstd`.
+### `--zstd` (optional compression switch)
+
+* `--zstd` is no longer an output format. It compresses the byte stream produced by `text`, `binary`, or `delta16` into a standard zstd frame.
+* If the current build has no zstd support, `--zstd` fails with `zstd not supported in this build`.
+* Compatibility aliases: `--out-format zstd` and `--out-format zstd+delta` map to `--out-format delta16 --zstd` (deprecated).
 
 ---
 
@@ -260,7 +265,8 @@ typedef enum calcprime_wheel_type {
 typedef enum calcprime_output_format {
     CALCPRIME_OUTPUT_TEXT        = 0,
     CALCPRIME_OUTPUT_BINARY      = 1,
-    CALCPRIME_OUTPUT_ZSTD_DELTA  = 2
+    CALCPRIME_OUTPUT_DELTA16     = 2,
+    CALCPRIME_OUTPUT_ZSTD_DELTA  = CALCPRIME_OUTPUT_DELTA16 // deprecated alias
 } calcprime_output_format;
 
 struct calcprime_cancel_token;
@@ -294,6 +300,7 @@ typedef struct calcprime_range_options {
     calcprime_progress_callback     progress_callback;    // optional: progress callback
     void*       progress_user_data;
     calcprime_cancel_token*        cancel_token;         // optional: cancellable
+    int         compress_zstd;      // 1 = enable zstd compression (if supported)
 } calcprime_range_options;
 ```
 
@@ -490,7 +497,7 @@ Relevant code: `segmenter.*` / `cpu_info.*`
 ### 5. Counting & output
 
 * **Counting**: after the bitset is ready, call `count_zero_bits(bits, bit_count)`, with AVX2/AVX-512 `popcnt` variants when available.
-* **Output**: `PrimeWriter` maintains an I/O thread and a **chunk queue**; front-end enqueues encoded text/binary chunks; back-end writes file/stdout sequentially to reduce I/O impact. In `ZstdDelta` mode, Δ-encode first, then compress/assemble.
+* **Output**: `PrimeWriter` uses an I/O thread with a **chunk queue**; producers enqueue bytes encoded as `text`/`binary`/`delta16`, and the writer thread performs optional zstd streaming compression before writing to file/stdout.
 
 Relevant code: `popcnt.*` / `writer.*`
 
@@ -542,6 +549,6 @@ Relevant code: `prime_count.*`
 * **Wheel**: `--wheel 210` is often faster for large ranges; `1155` pre-sieves the most but has bigger masks/step tables and may not pay off for small ranges.
 * **Segments/tiles**: if you know the target cache hierarchy, set `--segment / --tile` manually; as a rule of thumb, **tile ≤ L1D, segment ≈ L2** performs well.
 * **Finding the K-th prime**: if memory is tight or you want predictable peaks, consider `--threads 1`. In parallel mode, the tool advances by segment counts and can still find it, with extra synchronization and potential re-scans for some segments.
-* **Output throughput**: for bulk export, prefer `--out-format binary` or `--out-format zstd`. Text is human-friendly but not storage/bandwidth-friendly.
+* **Output throughput**: for bulk export, prefer `--out-format binary`, or `--out-format delta16 --zstd`. Text is human-friendly but less storage/bandwidth efficient.
 * **Bounds**: all computations use `uint64_t`. Ensure `0 ≤ from < to` and the upper bound doesn’t overflow. Only odd numbers are marked; `2` is handled separately in a prefix step.
 * **Tests**: `ctest` includes examples (e.g., `--to 100000 --count --time`).

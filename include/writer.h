@@ -15,13 +15,14 @@ namespace calcprime{
 enum class PrimeOutputFormat{
 	Text,
 	Binary,
-	ZstdDelta,
+	Delta16,
 };
 
 class PrimeWriter{
   public:
 	PrimeWriter(bool enabled,const std::string&path="",
-				PrimeOutputFormat format=PrimeOutputFormat::Text);
+				PrimeOutputFormat format=PrimeOutputFormat::Text,
+				bool use_zstd=false);
 	~PrimeWriter();
 
 	bool enabled() const{ return enabled_; }
@@ -41,8 +42,12 @@ class PrimeWriter{
 	void flush_buffer();
 	void check_io_error() const;
 	void set_error(const std::string&message);
-	std::string encode_deltas(const std::vector<std::uint64_t>&primes);
-	std::string encode_delta_value(std::uint64_t value);
+	std::string encode_delta16(const std::vector<std::uint64_t>&primes);
+	std::string encode_delta16_value(std::uint64_t value);
+	void write_file_bytes(const char*data,std::size_t size);
+#if defined(CALCPRIME_HAS_ZSTD)
+	void flush_zstd_stream(bool final_frame);
+#endif
 
 	bool enabled_;
 	std::FILE*file_;
@@ -60,7 +65,11 @@ class PrimeWriter{
 	std::size_t buffer_threshold_;
 
 	PrimeOutputFormat format_;
+	bool use_zstd_;
+	bool has_first_prime_;
 	std::uint64_t previous_prime_;
+	void*zstd_cctx_;
+	std::string zstd_out_buffer_;
 
 	mutable std::mutex error_mutex_;
 	std::atomic<bool> io_error_;
