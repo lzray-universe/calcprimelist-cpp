@@ -204,7 +204,7 @@ calcprime_meissel_count(std::uint64_t from,std::uint64_t to,unsigned threads){
 	opts.to=to;
 	opts.threads=threads;
 	opts.wheel=CALCPRIME_WHEEL_MOD30;
-	opts.use_meissel=0;
+	opts.use_meissel=1;
 	opts.collect_primes=0;
 	opts.nth_index=0;
 	opts.write_to_file=0;
@@ -437,7 +437,7 @@ calcprime_run_range(const calcprime_range_options*options,
 	result->stats.prime_count=0;
 	result->stats.nth_index=opts.nth_index;
 	result->stats.nth_found=0;
-	result->stats.use_meissel=0;
+	result->stats.use_meissel=opts.use_meissel?1:0;
 	result->stats.completed=0;
 	result->stats.cancelled=0;
 	result->primes_collected=opts.collect_primes;
@@ -457,10 +457,9 @@ calcprime_run_range(const calcprime_range_options*options,
 
 	bool need_prime_delivery=
 		opts.collect_primes||opts.write_to_file||(opts.prime_callback!=nullptr);
-	if(opts.use_meissel){
+	if(opts.use_meissel&&(need_prime_delivery||opts.nth_index!=0)){
 		result->status=CALCPRIME_STATUS_INVALID_ARGUMENT;
-		result->error_message=
-			"Meissel path is disabled in this build";
+		result->error_message="Meissel mode supports counting only";
 		*out_result=result.release();
 		return CALCPRIME_STATUS_INVALID_ARGUMENT;
 	}
@@ -479,6 +478,79 @@ calcprime_run_range(const calcprime_range_options*options,
 	result->stats.threads=threads;
 
 	auto start_time=std::chrono::steady_clock::now();
+	if(opts.use_meissel){
+		if(opts.cancel_token&&
+		   opts.cancel_token->cancelled.load(std::memory_order_acquire)){
+			result->status=CALCPRIME_STATUS_CANCELLED;
+			result->error_message="operation cancelled";
+			result->stats.cancelled=1;
+			*out_result=result.release();
+			return (*out_result)->status;
+		}
+		if(opts.progress_callback){
+			int progress_result=0;
+			try{
+				progress_result=opts.progress_callback(0.0,opts.progress_user_data);
+			}catch(const std::exception&ex){
+				result->status=CALCPRIME_STATUS_INTERNAL_ERROR;
+				result->error_message=ex.what();
+				*out_result=result.release();
+				return (*out_result)->status;
+			}catch(...){
+				result->status=CALCPRIME_STATUS_INTERNAL_ERROR;
+				result->error_message="unknown error";
+				*out_result=result.release();
+				return (*out_result)->status;
+			}
+			if(progress_result!=0){
+				result->status=CALCPRIME_STATUS_CANCELLED;
+				result->error_message="progress callback requested cancellation";
+				result->stats.cancelled=1;
+				*out_result=result.release();
+				return (*out_result)->status;
+			}
+		}
+
+		std::uint64_t sqrt_limit=static_cast<std::uint64_t>(std::sqrt(
+									 static_cast<long double>(opts.to)))+
+								 1;
+		auto base_primes=calcprime::simple_sieve(sqrt_limit);
+		std::uint64_t total=
+			calcprime::meissel_count(opts.from,opts.to,base_primes,threads);
+		result->total_count=total;
+		result->stats.prime_count=total;
+		result->status=CALCPRIME_STATUS_SUCCESS;
+		result->stats.completed=1;
+
+		if(opts.progress_callback){
+			int progress_result=0;
+			try{
+				progress_result=opts.progress_callback(1.0,opts.progress_user_data);
+			}catch(const std::exception&ex){
+				result->status=CALCPRIME_STATUS_INTERNAL_ERROR;
+				result->error_message=ex.what();
+				result->stats.completed=0;
+			}catch(...){
+				result->status=CALCPRIME_STATUS_INTERNAL_ERROR;
+				result->error_message="unknown error";
+				result->stats.completed=0;
+			}
+			if(progress_result!=0&&result->status==CALCPRIME_STATUS_SUCCESS){
+				result->status=CALCPRIME_STATUS_CANCELLED;
+				result->error_message="progress callback requested cancellation";
+				result->stats.cancelled=1;
+				result->stats.completed=0;
+			}
+		}
+
+		auto end_time=std::chrono::steady_clock::now();
+		auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(
+			end_time-start_time);
+		result->stats.elapsed_us=static_cast<std::uint64_t>(elapsed.count());
+
+		*out_result=result.release();
+		return (*out_result)->status;
+	}
 
 	calcprime::WheelType wheel_type=opts.wheel;
 	const calcprime::Wheel&wheel=calcprime::get_wheel(wheel_type);

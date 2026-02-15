@@ -340,7 +340,7 @@ void print_usage(){
 		<<"  --zstd              Compress output stream with zstd (if supported)\n"
 		<<"  --time              Print elapsed time\n"
 		<<"  --stats             Print configuration statistics\n"
-		<<"  --ml                Disabled (Meissel path is not available)\n"
+		<<"  --ml                Use Meissel-Lehmer for counting (only with --count)\n"
 		<<"  --wheel-bitmap      Force wheel-compressed count path\n"
 		<<"                       (auto-enabled for large wheel=30 counts)\n"
 		<<"  --stest             Run built-in benchmark (1e6..1e11, 10 runs)\n"
@@ -897,10 +897,6 @@ int run_cli(int argc,char**argv){
 		if(threads==0){
 			threads=1;
 		}
-		if(opts.use_ml){
-			throw std::invalid_argument(
-				"--ml is disabled in this build (Meissel path unavailable)");
-		}
 
 		std::uint64_t odd_begin=opts.from<=3?3:opts.from;
 		if((odd_begin&1ULL)==0){
@@ -945,6 +941,32 @@ int run_cli(int argc,char**argv){
 		bool is_count_mode=
 			opts.count_only||(!opts.print_primes&&!opts.nth.has_value());
 		auto start_time=std::chrono::steady_clock::now();
+		if(opts.use_ml){
+			if(opts.print_primes||opts.nth.has_value()){
+				throw std::invalid_argument("--ml supports count mode only");
+			}
+			std::uint64_t total=
+				meissel_count(opts.from,opts.to,base_primes,threads);
+			auto end_time=std::chrono::steady_clock::now();
+			std::cout<<total<<"\n";
+
+			if(opts.show_stats){
+				std::cout<<"Threads: "<<threads<<"\n";
+				std::cout<<"Segment bytes: "<<config.segment_bytes<<"\n";
+				std::cout<<"Tile bytes: "<<config.tile_bytes<<"\n";
+				std::cout<<"L1d: "<<info.l1_data_bytes<<"  L2: "<<info.l2_bytes
+						 <<"\n";
+			}
+
+			if(opts.show_time){
+				auto elapsed=
+					std::chrono::duration_cast<std::chrono::microseconds>(
+						end_time-start_time)
+						.count();
+				std::cout<<"Elapsed: "<<elapsed<<" us\n";
+			}
+			return 0;
+		}
 
 		bool can_wheel_bitmap=is_count_mode&&!opts.print_primes&&
 							 !opts.nth.has_value()&&
