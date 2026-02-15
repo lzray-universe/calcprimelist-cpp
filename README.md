@@ -73,41 +73,43 @@ cmake --build build --config Release
 
 生成目标：
 
-* 可执行程序：`prime-sieve`
-* 可执行程序（静态链接项目静态库）：`prime-sieve-static`
+* 可执行程序：`calcprimelist`（Windows: `calcprimelist.exe`）
+* 可执行程序（静态链接项目静态库）：`calcprimelist-static`
 * 静态库：`calcprime`（以及同名的 `calcprime_static`）
 * 共享库（导出 C ABI，便于 DLL/FFI）：`calcprime-cli`
+
+> 说明：`--help` 输出里的命令前缀仍显示为 `prime-sieve`，在本仓库直接构建后请使用 `calcprimelist`（Windows 下为 `calcprimelist.exe`）。
 
 ### 快速试用
 
 ```bash
 # 计数：2 ≤ n < 100000 的素数个数（应为 9592）
-./build/prime-sieve --to 100000 --count --time
+./build/calcprimelist --to 100000 --count --time
 
 # 打印：1 ≤ n < 100 的素数（逐行）
-./build/prime-sieve --from 1 --to 100 --print
+./build/calcprimelist --from 1 --to 100 --print
 
 # 第 K 个素数：区间 [1, 100000) 内的第 100 个素数
-./build/prime-sieve --from 1 --to 100000 --nth 100
+./build/calcprimelist --from 1 --to 100000 --nth 100
 
 # 保存到文件（文本）：每行一个素数
-./build/prime-sieve --to 1000000 --print --out primes.txt
+./build/calcprimelist --to 1000000 --print --out primes.txt
 
 # 保存到文件（二进制 little-endian uint64）
-./build/prime-sieve --to 1000000 --print --out primes.bin --out-format binary
+./build/calcprimelist --to 1000000 --print --out primes.bin --out-format binary
 
 # 保存到文件（delta16 + Zstd；更省空间/带宽）
-./build/prime-sieve --to 10000000 --print --out primes.zst --out-format delta16 --zstd
+./build/calcprimelist --to 10000000 --print --out primes.zst --out-format delta16 --zstd
 ```
 
-> 支持科学计数法与大小后缀：`--to 1e8`、`--segment 1M`、`--tile 256K` 等。
+> 支持科学计数法、十六进制与大小后缀：`--to 1e8`、`--to 0x1e5`、`--segment 1M`、`--tile 256K` 等。
 
 ---
 
 ## 命令行用法与运行示例
 
 ```
-prime-sieve --from A --to B [options]
+calcprimelist --from A --to B [options]
 
   主功能（三选一，默认 --count）：
   --count             统计区间 [A, B) 的素数个数
@@ -129,6 +131,7 @@ prime-sieve --from A --to B [options]
 
   其他：
   --ml                用 Meissel-Lehmer 做计数（仅 --count）
+  --wheel-bitmap      强制使用 wheel-bitmap 计数路径
   --stest             自动基准测试（1e6..1e11，每点 10 次）
   --test N            对 N 做 Miller-Rabin 素性测试
   --help/-h           打印帮助
@@ -138,21 +141,24 @@ prime-sieve --from A --to B [options]
 
 ```bash
 # 1) 计数
-./prime-sieve --to 1e6 --count --time
+./calcprimelist --to 1e6 --count --time
 # 期望输出（示例）：78498
 # Elapsed: 123456 us
 
 # 2) 打印并压缩（delta16 + Zstd）
-./prime-sieve --from 1 --to 1e7 --print --out primes.zst --out-format delta16 --zstd
+./calcprimelist --from 1 --to 1e7 --print --out primes.zst --out-format delta16 --zstd
 
 # 3) 在大区间内找第 1e5 个素数（建议单线程以降低内存占用峰值）
-./prime-sieve --from 1 --to 1e8 --nth 100000 --threads 1 --time
+./calcprimelist --from 1 --to 1e8 --nth 100000 --threads 1 --time
 
 # 4) 指定更强的轮因子与更大分段（高吞吐场景）
-./prime-sieve --to 1e9 --count --wheel 210 --segment 8M --tile 256K --time
+./calcprimelist --to 1e9 --count --wheel 210 --segment 8M --tile 256K --time
 
 # 5) 一键性能基准（自动识别主机信息并输出 Markdown 表）
-./prime-sieve --stest
+./calcprimelist --stest
+
+# 6) 单点素性测试（无需 --to）
+./calcprimelist --test 1000000007
 ```
 
 ---
@@ -212,17 +218,20 @@ target_include_directories(your_target PRIVATE calcprimelist/include)
 * `#include <base_sieve.h>`
   `std::vector<uint32_t> simple_sieve(uint64_t limit);`
 * `#include <prime_count.h>`
-  `uint64_t meissel_count(uint64_t from, uint64_t to, unsigned threads=0);`
+  `uint64_t meissel_count(uint64_t from, uint64_t to, const std::vector<uint32_t>& primes, unsigned threads=0);`
   `bool miller_rabin_is_prime(uint64_t n);`
 * `#include <popcnt.h>`
   `uint64_t popcount_u64(uint64_t);`
   `uint64_t count_zero_bits(const uint64_t* bits, size_t bit_count);`
+
+> `meissel_count` 需要提供覆盖 `sqrt(to)` 的素数表，可先用 `simple_sieve` 生成。
 
 示例：
 
 ```cpp
 #include "base_sieve.h"
 #include "prime_count.h"
+#include <cmath>
 #include <iostream>
 
 int main() {
@@ -230,7 +239,10 @@ int main() {
     std::cout << "π(100) = " << primes.size() << "\n";
 
     // 计数 [1, 1e8)
-    std::uint64_t cnt = calcprime::meissel_count(1, 100000000);
+    std::uint64_t to = 100000000;
+    auto base = calcprime::simple_sieve(
+        static_cast<std::uint64_t>(std::sqrt(static_cast<long double>(to))) + 1);
+    std::uint64_t cnt = calcprime::meissel_count(1, to, base);
     std::cout << cnt << "\n";
 }
 ```
@@ -346,11 +358,13 @@ typedef struct calcprime_range_stats {
 calcprime_cpu_info        calcprime_detect_cpu_info(void);
 unsigned                  calcprime_effective_thread_count(const calcprime_cpu_info*);
 calcprime_segment_config  calcprime_choose_segment_config(const calcprime_cpu_info*,
+                                                          unsigned threads,
                                                           size_t requested_segment_bytes,
                                                           size_t requested_tile_bytes,
                                                           uint64_t range_length);
 
 // 运行
+int  calcprime_run_cli(int argc, char** argv);
 int  calcprime_range_options_init(calcprime_range_options* options);
 calcprime_cancel_token*  calcprime_cancel_token_create(void);
 void calcprime_cancel_token_destroy(calcprime_cancel_token*);
@@ -367,13 +381,13 @@ uint64_t          calcprime_range_result_count(const calcprime_range_run_result*
 int               calcprime_range_result_nth_prime(const calcprime_range_run_result*, uint64_t* out_value);
 int               calcprime_range_result_stats(const calcprime_range_run_result*, calcprime_range_stats* out);
 
-// 按段访问（两种方式）
+// 按段访问与汇总拷贝
 size_t            calcprime_range_result_segment_count(const calcprime_range_run_result*);
 // A) 直接返回内部指针（只读，生命周期受 result 管理）
 int               calcprime_range_result_segment(const calcprime_range_run_result*, size_t index,
                                                  const uint64_t** out_primes, size_t* out_count);
-// B) 拷贝到用户缓冲区
-int               calcprime_range_result_copy_primes(const calcprime_range_run_result*, size_t index,
+// B) 拷贝所有已收集素数到用户缓冲区（buffer=NULL 时可仅探测 out_written）
+int               calcprime_range_result_copy_primes(const calcprime_range_run_result*,
                                                      uint64_t* buffer, size_t capacity, size_t* out_written);
 
 void              calcprime_range_result_release(calcprime_range_run_result*);
@@ -542,10 +556,10 @@ int main() {
 ## 性能基准（π(x) 计数，多线程）
 
 > 对每个区间上界 `--to ∈ {1e6, 1e7, 1e8, 1e9, 1e10, 1e11}`，运行
-> `prime-sieve --to {N} --count --time` 重复 10 次，统计 **best / median / mean**。
-> Windows 等价命令：`.\prime-sieve.exe --to {N} --count --time`。
+> `calcprimelist --to {N} --count --time` 重复 10 次，统计 **best / median / mean**。
+> Windows 等价命令：`.\calcprimelist.exe --to {N} --count --time`。
 > 注：`--time` 为工具内计时（微秒），若不可用则以外部 wall-clock 计时。具体环境（CPU/内存/OS/编译器）会影响绝对值。
-> 也可直接运行：`prime-sieve --stest` 自动输出同格式表格。
+> 也可直接运行：`calcprimelist --stest` 自动输出同格式表格。
 
 **测试数据（10 次/每点）：**（本表来自 `Intel® Core™ Ultra 7 265K @ P 3.90 / E 3.30 GHz · 20C/20T (8P+12E)` `Microsoft Windows 11 Pro for Workstations, Version 25H2 (OS Build 26220.7052), x64`）
 
