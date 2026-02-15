@@ -14,6 +14,7 @@ set(CALCPRIME_SOURCES
     src/popcnt.cpp
     src/prime_count.cpp
     src/segmenter.cpp
+    src/wheel_bitmap_count.cpp
     src/writer.cpp
 )
 
@@ -61,6 +62,7 @@ function(calcprime_configure_library target)
 
     if(MSVC)
         target_compile_options(${target} PRIVATE /arch:AVX2 /W4)
+        target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/GL>)
     else()
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|i.86)")
@@ -92,15 +94,19 @@ if(MSVC)
     set_property(TARGET calcprime_static PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-add_executable(prime-sieve src/main.cpp)
+add_executable( calcprimelist src/main.cpp)
 
-target_link_libraries(prime-sieve PRIVATE calcprime)
-
-add_executable(prime-sieve-static src/main.cpp)
-target_link_libraries(prime-sieve-static PRIVATE calcprime_static)
+target_link_libraries( calcprimelist PRIVATE calcprime)
 if(MSVC)
-    set_property(TARGET prime-sieve-static PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-    target_compile_definitions(prime-sieve-static PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_link_options( calcprimelist PRIVATE $<$<CONFIG:Release>:/LTCG>)
+endif()
+
+add_executable( calcprimelist-static src/main.cpp)
+target_link_libraries( calcprimelist-static PRIVATE calcprime_static)
+if(MSVC)
+    set_property(TARGET  calcprimelist-static PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_definitions( calcprimelist-static PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_link_options( calcprimelist-static PRIVATE $<$<CONFIG:Release>:/LTCG>)
 endif()
 
 add_library(calcprime-cli SHARED src/main.cpp src/api.cpp)
@@ -108,25 +114,28 @@ target_link_libraries(calcprime-cli PRIVATE calcprime)
 target_compile_definitions(calcprime-cli PRIVATE CALCPRIME_DLL_BUILD CALCPRIME_DLL_EXPORT)
 target_include_directories(calcprime-cli PUBLIC include)
 calcprime_enable_zstd(calcprime-cli)
+if(MSVC)
+    target_link_options(calcprime-cli PRIVATE $<$<CONFIG:Release>:/LTCG>)
+endif()
 
 enable_testing()
 
 add_test(NAME prime_sieve_time_100k
-    COMMAND $<TARGET_FILE:prime-sieve> --to 100000 --count --time)
+    COMMAND $<TARGET_FILE: calcprimelist> --to 100000 --count --time)
 set_tests_properties(prime_sieve_time_100k
     PROPERTIES PASS_REGULAR_EXPRESSION "Elapsed: [0-9]+ us")
 
 add_test(NAME prime_sieve_scientific_to_100k
-    COMMAND $<TARGET_FILE:prime-sieve> --to 1e5 --count --time)
+    COMMAND $<TARGET_FILE: calcprimelist> --to 1e5 --count --time)
 set_tests_properties(prime_sieve_scientific_to_100k
     PROPERTIES PASS_REGULAR_EXPRESSION "9592;Elapsed: [0-9]+ us")
 
 add_test(NAME prime_sieve_hex_to_0x1e5_count
-    COMMAND $<TARGET_FILE:prime-sieve> --to 0x1e5 --count)
+    COMMAND $<TARGET_FILE: calcprimelist> --to 0x1e5 --count)
 set_tests_properties(prime_sieve_hex_to_0x1e5_count
     PROPERTIES PASS_REGULAR_EXPRESSION "(^|[^0-9])92([^0-9]|$)")
 
 add_test(NAME prime_sieve_even_only_range_count
-    COMMAND $<TARGET_FILE:prime-sieve> --from 8 --to 9 --count)
+    COMMAND $<TARGET_FILE: calcprimelist> --from 8 --to 9 --count)
 set_tests_properties(prime_sieve_even_only_range_count
     PROPERTIES PASS_REGULAR_EXPRESSION "(^|[^0-9])0([^0-9]|$)")

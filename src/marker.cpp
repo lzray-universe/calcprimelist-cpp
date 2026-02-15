@@ -6,6 +6,9 @@ namespace calcprime{
 namespace{
 
 std::size_t words_for_bits(std::size_t bits){ return (bits+63)/64; }
+std::uint64_t ceil_div_u64(std::uint64_t value,std::uint64_t divisor){
+	return value/divisor+((value%divisor)!=0ULL?1ULL:0ULL);
+}
 
 const SmallPrimePattern*find_small_pattern(const Wheel&wheel,
 										   std::uint32_t prime){
@@ -49,6 +52,9 @@ PrimeMarker::PrimeMarker(const Wheel&wheel,SegmentConfig config,
 		if(prime==2){
 			continue; // even numbers already excluded
 		}
+		if(wheel_.presieve_modulus%prime==0){
+			continue; // already removed by wheel presieve
+		}
 		if(prime<=small_prime_limit){
 			small_primes_.push_back(prime);
 			small_initial_.push_back(first_hit(prime,range_begin_));
@@ -69,10 +75,14 @@ PrimeMarker::PrimeMarker(const Wheel&wheel,SegmentConfig config,
 PrimeMarker::ThreadState
 PrimeMarker::make_thread_state(std::size_t thread_index,
 							   std::size_t thread_count) const{
+	if(thread_count==0){
+		thread_count=1;
+	}
 	ThreadState state;
 	state.bucket.reset(0);
 	state.small_positions=small_initial_;
 	state.medium_positions=medium_initial_;
+	state.medium_next.assign(medium_primes_.size(),-1);
 	std::size_t count=0;
 	for(std::size_t i=0;i<large_primes_template_.size();++i){
 		if(i%thread_count==thread_index){
@@ -106,6 +116,7 @@ void PrimeMarker::apply_small_primes(ThreadState&state,
 	if(tile.bit_count==0){
 		return;
 	}
+	const std::uint32_t tile_bits=static_cast<std::uint32_t>(tile.bit_count);
 	std::uint64_t tile_end=tile.start_value+tile.bit_count*2ULL;
 	for(std::size_t i=0;i<small_primes_.size();++i){
 		std::uint32_t prime=small_primes_[i];
@@ -146,26 +157,41 @@ void PrimeMarker::apply_small_primes(ThreadState&state,
 			pos+=skip*step;
 			state.small_positions[i]=pos;
 		}else{
-			std::uint64_t current=pos;
-			while(current<tile_end){
-				std::size_t bit_index=(current-tile.start_value)>>1;
-				std::size_t word=bit_index/64;
-				std::size_t bit=bit_index%64;
-				tile.word_ptr[word]|=(1ULL<<bit);
-				current+=step;
+			std::uint32_t bit_index=
+				static_cast<std::uint32_t>((pos-tile.start_value)>>1);
+			std::uint32_t bit_step=prime;
+			while(bit_index<tile_bits){
+				tile.word_ptr[bit_index>>6]|=(1ULL<<(bit_index&63ULL));
+				bit_index+=bit_step;
 			}
-			state.small_positions[i]=current;
+			state.small_positions[i]=
+				tile.start_value+(static_cast<std::uint64_t>(bit_index)<<1);
 		}
 	}
 }
 
-void PrimeMarker::apply_medium_primes(ThreadState&state,const TileView&tile,
-									  std::size_t /*segment_index*/) const{
+void PrimeMarker::apply_medium_primes(ThreadState&state,
+									  const TileView&tile,
+									  std::uint64_t segment_low,
+									  std::uint64_t segment_high,
+									  std::size_t tile_index,
+									  std::size_t tile_count) const{
 	if(tile.bit_count==0){
 		return;
 	}
+	if(tile_index>=state.medium_tile_heads.size()){
+		return;
+	}
+	std::int32_t head=state.medium_tile_heads[tile_index];
+	state.medium_tile_heads[tile_index]=-1;
+	if(head<0){
+		return;
+	}
+	const std::uint32_t tile_bits=static_cast<std::uint32_t>(tile.bit_count);
 	std::uint64_t tile_end=tile.start_value+tile.bit_count*2ULL;
-	for(std::size_t i=0;i<medium_primes_.size();++i){
+	while(head>=0){
+		std::size_t i=static_cast<std::size_t>(head);
+		head=state.medium_next[i];
 		std::uint32_t prime=medium_primes_[i];
 		std::uint64_t step=static_cast<std::uint64_t>(prime)*2ULL;
 		std::uint64_t pos=state.medium_positions[i];
@@ -174,14 +200,28 @@ void PrimeMarker::apply_medium_primes(ThreadState&state,const TileView&tile,
 			std::uint64_t skip=(delta+step-1)/step;
 			pos+=skip*step;
 		}
-		while(pos<tile_end){
-			std::size_t bit_index=(pos-tile.start_value)>>1;
-			std::size_t word=bit_index/64;
-			std::size_t bit=bit_index%64;
-			tile.word_ptr[word]|=(1ULL<<bit);
-			pos+=step;
+		if(pos<tile_end){
+			std::uint32_t bit_index=
+				static_cast<std::uint32_t>((pos-tile.start_value)>>1);
+			std::uint32_t bit_step=prime;
+			while(bit_index<tile_bits){
+				tile.word_ptr[bit_index>>6]|=(1ULL<<(bit_index&63ULL));
+				bit_index+=bit_step;
+			}
+			pos=tile.start_value+(static_cast<std::uint64_t>(bit_index)<<1);
 		}
 		state.medium_positions[i]=pos;
+		if(pos<segment_high){
+			std::size_t next_tile=static_cast<std::size_t>(
+				(pos-segment_low)/config_.tile_span);
+			if(next_tile>=tile_count){
+				next_tile=tile_count-1;
+			}
+			state.medium_next[i]=state.medium_tile_heads[next_tile];
+			state.medium_tile_heads[next_tile]=static_cast<std::int32_t>(i);
+		}else{
+			state.medium_next[i]=-1;
+		}
 	}
 }
 
@@ -229,13 +269,47 @@ void PrimeMarker::sieve_segment(ThreadState&state,std::uint64_t segment_id,
 		return;
 	}
 	std::size_t word_count=words_for_bits(bit_count);
-	bitset.assign(word_count,0);
+	bitset.resize(word_count);
 
-	wheel_.apply_presieve(segment_low,bit_count,bitset.data());
+	wheel_.fill_presieve(segment_low,bit_count,bitset.data());
 	apply_large_primes(state,segment_id,segment_low,segment_high,bitset);
+
+	std::size_t tile_count=
+		static_cast<std::size_t>(ceil_div_u64(
+			segment_high-segment_low,config_.tile_span));
+	if(tile_count==0){
+		tile_count=1;
+	}
+	state.medium_tile_heads.assign(tile_count,-1);
+	if(state.medium_next.size()!=medium_primes_.size()){
+		state.medium_next.assign(medium_primes_.size(),-1);
+	}
+	for(std::size_t i=0;i<medium_primes_.size();++i){
+		std::uint32_t prime=medium_primes_[i];
+		std::uint64_t step=static_cast<std::uint64_t>(prime)*2ULL;
+		std::uint64_t pos=state.medium_positions[i];
+		if(pos<segment_low){
+			std::uint64_t delta=segment_low-pos;
+			std::uint64_t skip=(delta+step-1)/step;
+			pos+=skip*step;
+			state.medium_positions[i]=pos;
+		}
+		if(pos>=segment_high){
+			state.medium_next[i]=-1;
+			continue;
+		}
+		std::size_t next_tile=static_cast<std::size_t>(
+			(pos-segment_low)/config_.tile_span);
+		if(next_tile>=tile_count){
+			next_tile=tile_count-1;
+		}
+		state.medium_next[i]=state.medium_tile_heads[next_tile];
+		state.medium_tile_heads[next_tile]=static_cast<std::int32_t>(i);
+	}
 
 	std::uint64_t tile_low=segment_low;
 	std::size_t bit_offset=0;
+	std::size_t tile_index=0;
 	while(tile_low<segment_high){
 		std::uint64_t tile_high=
 			std::min<std::uint64_t>(segment_high,tile_low+config_.tile_span);
@@ -244,31 +318,15 @@ void PrimeMarker::sieve_segment(ThreadState&state,std::uint64_t segment_id,
 		TileView tile{tile_low,bit_offset,tile_bits,
 					  bitset.data()+(bit_offset/64),tile_words};
 		apply_small_primes(state,tile);
-		apply_medium_primes(state,tile,segment_id);
+		apply_medium_primes(state,tile,segment_low,segment_high,tile_index,
+							tile_count);
 		if(tile_bits%64!=0&&tile_words>0){
 			std::uint64_t mask=(1ULL<<(tile_bits%64))-1;
 			tile.word_ptr[tile_words-1]&=mask;
 		}
 		tile_low=tile_high;
 		bit_offset+=tile_bits;
-	}
-
-	std::uint64_t segment_end=segment_high;
-	for(std::size_t i=0;i<medium_primes_.size();++i){
-		std::uint64_t step=static_cast<std::uint64_t>(medium_primes_[i])*2ULL;
-		if(state.medium_positions[i]<segment_end){
-			std::uint64_t delta=segment_end-state.medium_positions[i];
-			std::uint64_t skip=(delta+step-1)/step;
-			state.medium_positions[i]+=skip*step;
-		}
-	}
-	for(std::size_t i=0;i<small_primes_.size();++i){
-		std::uint64_t step=static_cast<std::uint64_t>(small_primes_[i])*2ULL;
-		if(state.small_positions[i]<segment_end){
-			std::uint64_t delta=segment_end-state.small_positions[i];
-			std::uint64_t skip=(delta+step-1)/step;
-			state.small_positions[i]+=skip*step;
-		}
+		++tile_index;
 	}
 }
 

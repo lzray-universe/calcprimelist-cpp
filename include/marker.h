@@ -36,6 +36,8 @@ class PrimeMarker{
 		std::vector<std::uint64_t> small_positions;
 		std::vector<LargePrimeState> large_states;
 		std::vector<std::uint64_t> medium_positions;
+		std::vector<std::int32_t> medium_next;
+		std::vector<std::int32_t> medium_tile_heads;
 	};
 
 	ThreadState make_thread_state(std::size_t thread_index,
@@ -62,7 +64,9 @@ class PrimeMarker{
 	static std::uint64_t first_hit(std::uint32_t prime,std::uint64_t start);
 	void apply_small_primes(ThreadState&state,const TileView&tile) const;
 	void apply_medium_primes(ThreadState&state,const TileView&tile,
-							 std::size_t segment_index) const;
+							 std::uint64_t segment_low,
+							 std::uint64_t segment_high,std::size_t tile_index,
+							 std::size_t tile_count) const;
 	void apply_large_primes(ThreadState&state,std::uint64_t segment_id,
 							std::uint64_t segment_low,
 							std::uint64_t segment_high,

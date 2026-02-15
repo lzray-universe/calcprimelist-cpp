@@ -196,14 +196,30 @@ extern "C" int calcprime_run_cli(int argc,char**argv){
 
 extern "C" std::uint64_t
 calcprime_meissel_count(std::uint64_t from,std::uint64_t to,unsigned threads){
-	std::uint64_t sqrt_limit=0;
-	if(to>1){
-		sqrt_limit=
-			static_cast<std::uint64_t>(std::sqrt(static_cast<long double>(to)))+
-			1;
+	calcprime_range_options opts{};
+	if(calcprime_range_options_init(&opts)!=0){
+		return 0;
 	}
-	auto primes=calcprime::simple_sieve(sqrt_limit);
-	return calcprime::meissel_count(from,to,primes,threads);
+	opts.from=from;
+	opts.to=to;
+	opts.threads=threads;
+	opts.wheel=CALCPRIME_WHEEL_MOD30;
+	opts.use_meissel=0;
+	opts.collect_primes=0;
+	opts.nth_index=0;
+	opts.write_to_file=0;
+
+	calcprime_range_run_result*run_result=nullptr;
+	calcprime_status status=calcprime_run_range(&opts,&run_result);
+	if(status!=CALCPRIME_STATUS_SUCCESS||!run_result){
+		if(run_result){
+			calcprime_range_result_release(run_result);
+		}
+		return 0;
+	}
+	std::uint64_t count=calcprime_range_result_count(run_result);
+	calcprime_range_result_release(run_result);
+	return count;
 }
 
 extern "C" int calcprime_miller_rabin_is_prime(std::uint64_t n){
@@ -242,11 +258,9 @@ extern "C" std::uint64_t
 calcprime_meissel_count_with_primes(std::uint64_t from,std::uint64_t to,
 									const std::uint32_t*primes,
 									std::size_t prime_count,unsigned threads){
-	std::vector<std::uint32_t> prime_vec;
-	if(primes&&prime_count>0){
-		prime_vec.assign(primes,primes+prime_count);
-	}
-	return calcprime::meissel_count(from,to,prime_vec,threads);
+	(void)primes;
+	(void)prime_count;
+	return calcprime_meissel_count(from,to,threads);
 }
 
 extern "C" calcprime_cpu_info calcprime_detect_cpu_info(void){
@@ -423,7 +437,7 @@ calcprime_run_range(const calcprime_range_options*options,
 	result->stats.prime_count=0;
 	result->stats.nth_index=opts.nth_index;
 	result->stats.nth_found=0;
-	result->stats.use_meissel=opts.use_meissel?1:0;
+	result->stats.use_meissel=0;
 	result->stats.completed=0;
 	result->stats.cancelled=0;
 	result->primes_collected=opts.collect_primes;
@@ -443,9 +457,10 @@ calcprime_run_range(const calcprime_range_options*options,
 
 	bool need_prime_delivery=
 		opts.collect_primes||opts.write_to_file||(opts.prime_callback!=nullptr);
-	if(opts.use_meissel&&(need_prime_delivery||opts.nth_index!=0)){
+	if(opts.use_meissel){
 		result->status=CALCPRIME_STATUS_INVALID_ARGUMENT;
-		result->error_message="Meissel counting cannot emit primes";
+		result->error_message=
+			"Meissel path is disabled in this build";
 		*out_result=result.release();
 		return CALCPRIME_STATUS_INVALID_ARGUMENT;
 	}
@@ -464,52 +479,6 @@ calcprime_run_range(const calcprime_range_options*options,
 	result->stats.threads=threads;
 
 	auto start_time=std::chrono::steady_clock::now();
-
-	if(opts.use_meissel){
-		try{
-			std::uint64_t sqrt_limit=0;
-			if(opts.to>1){
-				sqrt_limit=static_cast<std::uint64_t>(
-							   std::sqrt(static_cast<long double>(opts.to)))+
-						   1;
-			}
-			auto primes=calcprime::simple_sieve(sqrt_limit);
-			std::uint64_t count=
-				calcprime::meissel_count(opts.from,opts.to,primes,threads);
-			auto end_time=std::chrono::steady_clock::now();
-			auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(
-				end_time-start_time);
-			result->total_count=count;
-			result->stats.prime_count=count;
-			result->stats.elapsed_us=
-				static_cast<std::uint64_t>(elapsed.count());
-			result->stats.segment=calcprime_segment_config{};
-			result->stats.segments_total=0;
-			result->stats.segments_processed=0;
-			result->stats.completed=1;
-		}catch(const std::exception&ex){
-			result->status=CALCPRIME_STATUS_INTERNAL_ERROR;
-			result->error_message=ex.what();
-		}catch(...){
-			result->status=CALCPRIME_STATUS_INTERNAL_ERROR;
-			result->error_message="unknown error";
-		}
-
-		if(opts.progress_callback&&result->status==CALCPRIME_STATUS_SUCCESS){
-			try{
-				opts.progress_callback(1.0,opts.progress_user_data);
-			}catch(const std::exception&ex){
-				result->status=CALCPRIME_STATUS_INTERNAL_ERROR;
-				result->error_message=ex.what();
-			}catch(...){
-				result->status=CALCPRIME_STATUS_INTERNAL_ERROR;
-				result->error_message="unknown error";
-			}
-		}
-
-		*out_result=result.release();
-		return (*out_result)->status;
-	}
 
 	calcprime::WheelType wheel_type=opts.wheel;
 	const calcprime::Wheel&wheel=calcprime::get_wheel(wheel_type);
@@ -547,10 +516,10 @@ calcprime_run_range(const calcprime_range_options*options,
 							 1;
 	auto base_primes=calcprime::simple_sieve(sqrt_limit);
 
-	std::uint32_t small_limit=29u;
+	std::uint32_t small_limit=19u;
 	switch(wheel_type){
 	case calcprime::WheelType::Mod30:
-		small_limit=29u;
+		small_limit=19u;
 		break;
 	case calcprime::WheelType::Mod210:
 		small_limit=47u;
@@ -644,19 +613,8 @@ calcprime_run_range(const calcprime_range_options*options,
 	if(opts.from<=2&&opts.to>2){
 		prefix_primes.push_back(2);
 	}
-	std::vector<std::uint64_t> wheel_primes;
-	switch(wheel_type){
-	case calcprime::WheelType::Mod30:
-		wheel_primes={3,5};
-		break;
-	case calcprime::WheelType::Mod210:
-		wheel_primes={3,5,7};
-		break;
-	case calcprime::WheelType::Mod1155:
-		wheel_primes={3,5,7,11};
-		break;
-	}
-	for(std::uint64_t p : wheel_primes){
+	for(std::uint16_t p16 : wheel.presieved_primes){
+		std::uint64_t p=static_cast<std::uint64_t>(p16);
 		if(p>=opts.from&&p<opts.to){
 			prefix_primes.push_back(p);
 		}
@@ -1070,3 +1028,13 @@ extern "C" std::uint64_t calcprime_count_zero_bits(const std::uint64_t*bits,
 	}
 	return calcprime::count_zero_bits(bits,bit_count);
 }
+
+
+
+
+
+
+
+
+
+

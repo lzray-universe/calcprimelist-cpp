@@ -138,6 +138,13 @@ SegmentConfig choose_segment_config(const CpuInfo&info,unsigned threads,
 	}
 
 	segment_bytes=align_to(segment_bytes,128);
+	if(!requested_segment_bytes){
+		if(thread_count<=1){
+			segment_bytes=std::max<std::size_t>(segment_bytes,1024*1024);
+		}else{
+			segment_bytes=std::max<std::size_t>(segment_bytes,768*1024);
+		}
+	}
 	if(cap_limit_bytes){
 		std::size_t cap_aligned=align_down(cap_limit_bytes,128);
 		if(cap_aligned==0&&cap_limit_bytes){
@@ -154,6 +161,9 @@ SegmentConfig choose_segment_config(const CpuInfo&info,unsigned threads,
 	std::size_t tile_bytes=requested_tile_bytes;
 	if(!tile_bytes){
 		std::size_t target=std::max<std::size_t>(l1,8*1024);
+		if(thread_count<=1&&target<64*1024){
+			target=64*1024;
+		}
 		tile_bytes=align_to(target,128);
 	}else{
 		tile_bytes=align_to(requested_tile_bytes,128);

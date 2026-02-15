@@ -25,11 +25,19 @@ struct SmallPrimePattern{
 struct Wheel{
 	WheelType type;
 	std::uint32_t modulus;
+	std::uint32_t presieve_modulus;
 	std::vector<std::uint8_t> allowed; // allowed residues modulo modulus
 	std::vector<std::uint16_t> residues;
 	std::vector<std::uint16_t> steps;
+	std::vector<std::uint16_t> presieved_primes;
 	std::vector<SmallPrimePattern> small_patterns;
+	std::vector<std::uint64_t> presieve_word_masks;
+	std::vector<std::uint16_t> presieve_next_phase;
+	std::vector<std::uint64_t> presieve_block_masks; // flattened [phase][word]
+	std::vector<std::uint16_t> presieve_next_block_phase;
 
+	void fill_presieve(std::uint64_t start_value,std::size_t bit_count,
+					   std::uint64_t*bits) const;
 	void apply_presieve(std::uint64_t start_value,std::size_t bit_count,
 						std::uint64_t*bits) const;
 };

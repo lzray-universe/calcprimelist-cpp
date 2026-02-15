@@ -4,6 +4,7 @@
 #include "popcnt.h"
 #include "prime_count.h"
 #include "segmenter.h"
+#include "wheel_bitmap_count.h"
 #include "wheel.h"
 #include "writer.h"
 
@@ -48,6 +49,7 @@ struct Options{
 	bool show_time=false;
 	bool show_stats=false;
 	bool use_ml=false;
+	bool use_wheel_bitmap=false;
 	bool help=false;
 	std::optional<std::uint64_t> test_value;
 };
@@ -293,6 +295,8 @@ Options parse_options(int argc,char**argv){
 			opts.show_stats=true;
 		}else if(arg=="--ml"){
 			opts.use_ml=true;
+		}else if(arg=="--wheel-bitmap"){
+			opts.use_wheel_bitmap=true;
 		}else if(arg=="--test"){
 			if(i+1>=argc){
 				throw std::invalid_argument("--test requires a value");
@@ -321,7 +325,9 @@ void print_usage(){
 		<<"  --zstd              Compress output stream with zstd (if supported)\n"
 		<<"  --time              Print elapsed time\n"
 		<<"  --stats             Print configuration statistics\n"
-		<<"  --ml                Use Meissel-Lehmer counting for --count\n"
+		<<"  --ml                Disabled (Meissel path is not available)\n"
+		<<"  --wheel-bitmap      Force wheel-compressed count path\n"
+		<<"                       (auto-enabled for large wheel=30 counts)\n"
 		<<"  --test N           Run a Miller-Rabin primality check for N\n";
 }
 
@@ -368,6 +374,10 @@ int run_cli(int argc,char**argv){
 		if(threads==0){
 			threads=1;
 		}
+		if(opts.use_ml){
+			throw std::invalid_argument(
+				"--ml is disabled in this build (Meissel path unavailable)");
+		}
 
 		std::uint64_t odd_begin=opts.from<=3?3:opts.from;
 		if((odd_begin&1ULL)==0){
@@ -387,10 +397,10 @@ int run_cli(int argc,char**argv){
 		SegmentConfig config=choose_segment_config(
 			info,threads,opts.segment_bytes,opts.tile_bytes,length);
 		const Wheel&wheel=get_wheel(opts.wheel);
-		std::uint32_t small_limit=29u;
+		std::uint32_t small_limit=19u;
 		switch(opts.wheel){
 		case WheelType::Mod30:
-			small_limit=29u;
+			small_limit=19u;
 			break;
 		case WheelType::Mod210:
 			small_limit=47u;
@@ -413,18 +423,32 @@ int run_cli(int argc,char**argv){
 			opts.count_only||(!opts.print_primes&&!opts.nth.has_value());
 		auto start_time=std::chrono::steady_clock::now();
 
-		if(opts.use_ml&&is_count_mode){
-			std::uint64_t result=
-				meissel_count(opts.from,opts.to,base_primes,threads);
-			auto end_time=std::chrono::steady_clock::now();
+		bool can_wheel_bitmap=is_count_mode&&!opts.print_primes&&
+							 !opts.nth.has_value()&&
+							 supports_wheel_bitmap_count(opts.wheel);
+		std::uint64_t span=
+			(opts.to>opts.from)?(opts.to-opts.from):0ULL;
+		bool auto_wheel_bitmap=
+			can_wheel_bitmap&&!opts.use_wheel_bitmap&&
+			opts.segment_bytes==0&&opts.wheel==WheelType::Mod30&&
+			((threads<=1&&span>=1000000000ULL)||
+			 (threads>1&&span>=8000000000ULL));
+		bool use_wheel_bitmap_path=can_wheel_bitmap&&
+								   (opts.use_wheel_bitmap||auto_wheel_bitmap);
 
-			std::cout<<result<<"\n";
+		if(use_wheel_bitmap_path){
+			std::uint64_t total=count_primes_wheel_bitmap(
+				opts.from,opts.to,threads,opts.wheel,config,base_primes,
+				opts.segment_bytes!=0);
+			auto end_time=std::chrono::steady_clock::now();
+			std::cout<<total<<"\n";
 
 			if(opts.show_stats){
-				unsigned ml_threads=threads==0?1u:threads;
-				std::cout<<"Threads: "<<ml_threads<<"\n";
-				std::cout<<"Segment bytes: 0\n";
-				std::cout<<"Tile bytes: 0\n";
+				std::cout<<"Wheel bitmap: "
+						 <<(opts.use_wheel_bitmap?"forced":"auto")<<"\n";
+				std::cout<<"Threads: "<<threads<<"\n";
+				std::cout<<"Segment bytes: "<<config.segment_bytes<<"\n";
+				std::cout<<"Tile bytes: "<<config.tile_bytes<<"\n";
 				std::cout<<"L1d: "<<info.l1_data_bytes<<"  L2: "<<info.l2_bytes
 						 <<"\n";
 			}
@@ -436,7 +460,6 @@ int run_cli(int argc,char**argv){
 						.count();
 				std::cout<<"Elapsed: "<<elapsed<<" us\n";
 			}
-
 			return 0;
 		}
 
@@ -460,19 +483,8 @@ int run_cli(int argc,char**argv){
 		if(include_two){
 			prefix_primes.push_back(2);
 		}
-		std::vector<std::uint64_t> wheel_primes;
-		switch(opts.wheel){
-		case WheelType::Mod30:
-			wheel_primes={3,5};
-			break;
-		case WheelType::Mod210:
-			wheel_primes={3,5,7};
-			break;
-		case WheelType::Mod1155:
-			wheel_primes={3,5,7,11};
-			break;
-		}
-		for(std::uint64_t p : wheel_primes){
+		for(std::uint16_t p16 : wheel.presieved_primes){
+			std::uint64_t p=static_cast<std::uint64_t>(p16);
 			if(p>=opts.from&&p<opts.to){
 				prefix_primes.push_back(p);
 			}
@@ -481,6 +493,55 @@ int run_cli(int argc,char**argv){
 
 		if(opts.nth.has_value()&&opts.nth.value()<=prefix_count){
 			std::cout<<prefix_primes[opts.nth.value()-1]<<"\n";
+			return 0;
+		}
+
+		if(is_count_mode&&!opts.print_primes&&!opts.nth.has_value()){
+			std::atomic<std::uint64_t> total{prefix_count};
+			for(unsigned t=0;t<threads;++t){
+				workers.emplace_back([&,t](){
+					auto state=marker.make_thread_state(t,threads);
+					std::vector<std::uint64_t> bitset;
+					std::uint64_t local_total=0;
+					while(true){
+						std::uint64_t segment_id=0;
+						std::uint64_t seg_low=0;
+						std::uint64_t seg_high=0;
+						if(!queue.next(segment_id,seg_low,seg_high)){
+							break;
+						}
+						marker.sieve_segment(state,segment_id,seg_low,seg_high,
+											 bitset);
+						std::size_t bit_count=
+							static_cast<std::size_t>((seg_high-seg_low)>>1);
+						local_total+=count_zero_bits(bitset.data(),bit_count);
+					}
+					total.fetch_add(local_total,std::memory_order_relaxed);
+				});
+			}
+			for(auto&th : workers){
+				th.join();
+			}
+
+			auto end_time=std::chrono::steady_clock::now();
+			std::cout<<total.load(std::memory_order_relaxed)<<"\n";
+
+			if(opts.show_stats){
+				std::cout<<"Threads: "<<threads<<"\n";
+				std::cout<<"Segment bytes: "<<config.segment_bytes<<"\n";
+				std::cout<<"Tile bytes: "<<config.tile_bytes<<"\n";
+				std::cout<<"L1d: "<<info.l1_data_bytes<<"  L2: "<<info.l2_bytes
+						 <<"\n";
+			}
+
+			if(opts.show_time){
+				auto elapsed=
+					std::chrono::duration_cast<std::chrono::microseconds>(
+						end_time-start_time)
+						.count();
+				std::cout<<"Elapsed: "<<elapsed<<" us\n";
+			}
+
 			return 0;
 		}
 
@@ -690,3 +751,13 @@ int run_cli(int argc,char**argv){
 #ifndef CALCPRIME_DLL_BUILD
 int main(int argc,char**argv){ return calcprime::run_cli(argc,argv); }
 #endif
+
+
+
+
+
+
+
+
+
+

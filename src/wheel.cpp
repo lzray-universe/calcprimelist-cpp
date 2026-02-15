@@ -2,10 +2,20 @@
 
 #include<algorithm>
 #include<bit>
+#include<cstring>
 #include<numeric>
 
 namespace calcprime{
 namespace{
+
+constexpr std::size_t kPresieveBlockWords=16;
+
+std::vector<std::uint16_t> build_presieve_primes(WheelType type){
+	(void)type;
+	// Keep the presieve modulus compact so all wheels can share fast tables
+	// while pre-sieving more than the base wheel factors.
+	return {3,5,7,11,13};
+}
 
 SmallPrimePattern build_small_pattern(std::uint32_t prime){
 	SmallPrimePattern pattern{};
@@ -46,6 +56,11 @@ Wheel build_wheel(std::uint32_t modulus,WheelType type){
 	Wheel wheel;
 	wheel.type=type;
 	wheel.modulus=modulus;
+	wheel.presieved_primes=build_presieve_primes(type);
+	wheel.presieve_modulus=1;
+	for(std::uint16_t prime : wheel.presieved_primes){
+		wheel.presieve_modulus*=prime;
+	}
 	wheel.allowed.assign(modulus,0);
 
 	for(std::uint32_t r=0;r<modulus;++r){
@@ -69,10 +84,10 @@ Wheel build_wheel(std::uint32_t modulus,WheelType type){
 
 	static const std::uint32_t kSmallPrimes[]={3, 5, 7, 11,13,17,19,
 											   23,29,31,37,41,43,47};
-	std::uint32_t small_limit=29u;
+	std::uint32_t small_limit=19u;
 	switch(type){
 	case WheelType::Mod30:
-		small_limit=29u;
+		small_limit=19u;
 		break;
 	case WheelType::Mod210:
 		small_limit=47u;
@@ -87,6 +102,47 @@ Wheel build_wheel(std::uint32_t modulus,WheelType type){
 		}
 		wheel.small_patterns.push_back(build_small_pattern(prime));
 	}
+
+	std::uint32_t presieve_modulus=wheel.presieve_modulus;
+	std::vector<std::uint8_t> presieve_allowed(presieve_modulus,0);
+	for(std::uint32_t residue=0;residue<presieve_modulus;++residue){
+		if(std::gcd(residue,presieve_modulus)==1){
+			presieve_allowed[residue]=1;
+		}
+	}
+
+	wheel.presieve_word_masks.assign(presieve_modulus,0);
+	wheel.presieve_next_phase.assign(presieve_modulus,0);
+	for(std::uint32_t phase=0;phase<presieve_modulus;++phase){
+		std::uint32_t rem=phase;
+		std::uint64_t mask=0;
+		for(std::uint32_t bit=0;bit<64;++bit){
+			if(!presieve_allowed[rem]){
+				mask|=(1ULL<<bit);
+			}
+			rem+=2;
+			if(rem>=presieve_modulus){
+				rem-=presieve_modulus;
+			}
+		}
+		wheel.presieve_word_masks[phase]=mask;
+		wheel.presieve_next_phase[phase]=static_cast<std::uint16_t>(rem);
+	}
+	wheel.presieve_block_masks.assign(
+		static_cast<std::size_t>(presieve_modulus)*kPresieveBlockWords,0);
+	wheel.presieve_next_block_phase.assign(presieve_modulus,0);
+	for(std::uint32_t phase=0;phase<presieve_modulus;++phase){
+		std::uint32_t rem=phase;
+		std::size_t base=
+			static_cast<std::size_t>(phase)*kPresieveBlockWords;
+		for(std::size_t word=0;word<kPresieveBlockWords;++word){
+			wheel.presieve_block_masks[base+word]=wheel.presieve_word_masks[rem];
+			rem=wheel.presieve_next_phase[rem];
+		}
+		wheel.presieve_next_block_phase[phase]=
+			static_cast<std::uint16_t>(rem);
+	}
+
 	return wheel;
 }
 
@@ -109,21 +165,82 @@ const Wheel&get_wheel(WheelType type){
 
 void Wheel::apply_presieve(std::uint64_t start_value,std::size_t bit_count,
 						   std::uint64_t*bits) const{
-	if(allowed.empty()){
+	if(presieve_modulus==0||presieve_word_masks.empty()||
+	   presieve_next_phase.empty()){
 		return;
 	}
-	std::uint32_t rem=static_cast<std::uint32_t>(start_value%modulus);
-	for(std::size_t idx=0;idx<bit_count;++idx){
-		if(!allowed[rem]){
-			std::size_t word=idx/64;
-			std::size_t bit=idx%64;
-			bits[word]|=(1ULL<<bit);
+	std::uint32_t phase=
+		static_cast<std::uint32_t>(start_value%presieve_modulus);
+	std::size_t full_words=bit_count/64;
+	std::size_t rem_bits=bit_count%64;
+	std::size_t word=0;
+	if(!presieve_block_masks.empty()&&!presieve_next_block_phase.empty()){
+		std::size_t block_count=full_words/kPresieveBlockWords;
+		std::uint64_t*dst=bits;
+		for(std::size_t block=0;block<block_count;++block){
+			const std::uint64_t*masks=
+				&presieve_block_masks[static_cast<std::size_t>(phase)*
+									 kPresieveBlockWords];
+			for(std::size_t i=0;i<kPresieveBlockWords;++i){
+				dst[i]|=masks[i];
+			}
+			dst+=kPresieveBlockWords;
+			phase=presieve_next_block_phase[phase];
 		}
-		rem+=2;
-		if(rem>=modulus){
-			rem-=modulus;
+		word=block_count*kPresieveBlockWords;
+	}
+	for(;word<full_words;++word){
+		bits[word]|=presieve_word_masks[phase];
+		phase=presieve_next_phase[phase];
+	}
+	if(rem_bits){
+		std::uint64_t tail_mask=(1ULL<<rem_bits)-1ULL;
+		bits[full_words]|=(presieve_word_masks[phase]&tail_mask);
+	}
+}
+
+void Wheel::fill_presieve(std::uint64_t start_value,std::size_t bit_count,
+						  std::uint64_t*bits) const{
+	if(presieve_modulus==0||presieve_word_masks.empty()||
+	   presieve_next_phase.empty()){
+		return;
+	}
+	std::uint32_t phase=
+		static_cast<std::uint32_t>(start_value%presieve_modulus);
+	std::size_t full_words=bit_count/64;
+	std::size_t rem_bits=bit_count%64;
+	std::size_t word=0;
+	if(!presieve_block_masks.empty()&&!presieve_next_block_phase.empty()){
+		std::size_t block_count=full_words/kPresieveBlockWords;
+		std::uint64_t*dst=bits;
+		for(std::size_t block=0;block<block_count;++block){
+			const std::uint64_t*masks=
+				&presieve_block_masks[static_cast<std::size_t>(phase)*
+									 kPresieveBlockWords];
+			std::memcpy(dst,masks,sizeof(std::uint64_t)*kPresieveBlockWords);
+			dst+=kPresieveBlockWords;
+			phase=presieve_next_block_phase[phase];
 		}
+		word=block_count*kPresieveBlockWords;
+	}
+	for(;word<full_words;++word){
+		bits[word]=presieve_word_masks[phase];
+		phase=presieve_next_phase[phase];
+	}
+	if(rem_bits){
+		std::uint64_t tail_mask=(1ULL<<rem_bits)-1ULL;
+		bits[full_words]=(presieve_word_masks[phase]&tail_mask);
 	}
 }
 
 } // namespace calcprime
+
+
+
+
+
+
+
+
+
+
