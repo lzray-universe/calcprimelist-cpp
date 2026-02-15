@@ -119,6 +119,7 @@ prime-sieve --from A --to B [options]
 
   Misc:
   --ml                Use Meissel–Lehmer for counting (only with --count)
+  --stest             Run automatic benchmark (1e6..1e11, 10 runs each)
   --test N            Miller–Rabin primality test for N
   --help/-h           Show help
 ```
@@ -139,6 +140,9 @@ prime-sieve --from A --to B [options]
 
 # 4) Stronger wheel and larger segment sizes (throughput-oriented)
 ./prime-sieve --to 1e9 --count --wheel 210 --segment 8M --tile 256K --time
+
+# 5) One-command benchmark (auto-detect host info + Markdown table)
+./prime-sieve --stest
 ```
 
 ---
@@ -524,14 +528,15 @@ Relevant code: `prime_count.*`
 
 ---
 
-## Benchmarks (π(x) counting, multithreaded)
+## Benchmarks (pi(x) counting, multithreaded)
 
-> For each upper bound `--to ∈ {1e6, 1e7, 1e8, 1e9, 1e10}`, run
+> For each upper bound `--to in {1e6, 1e7, 1e8, 1e9, 1e10, 1e11}`, run
 > `prime-sieve --to {N} --count --time` 10 times and report **best / median / mean**.
 > Windows equivalent: `.\prime-sieve.exe --to {N} --count --time`.
-> Note: `--time` uses the tool’s internal timing (µs); if unavailable, wall-clock is used. Absolute values depend on CPU/RAM/OS/compiler.
+> Note: `--time` uses the tool's internal timing (us); if unavailable, wall-clock is used. Absolute values depend on CPU/RAM/OS/compiler.
+> You can also run `prime-sieve --stest` to generate this table automatically.
 
-**Test data (10 runs per point):** (table from `Intel® Core™ Ultra 7 265K @ P 3.90 / E 3.30 GHz · 20C/20T (8P+12E)` `Microsoft Windows 11 Pro for Workstations, Version 25H2 (OS Build 26220.7052), x64`)
+**Test data (10 runs per point):** (table from `Intel(R) Core(TM) Ultra 7 265K @ P 3.90 / E 3.30 GHz | 20C/20T (8P+12E)` `Microsoft Windows 11 Pro for Workstations, Version 25H2 (OS Build 26220.7052), x64`)
 
 |     N (`--to`) | runs | ok | best (s) | median (s) | mean (s) | throughput median (range/s) |
 | -------------: | ---: | -: | -------: | ---------: | -------: | --------------------------: |
@@ -540,6 +545,7 @@ Relevant code: `prime_count.*`
 |  100,000,000 |   10 | 10 |  0.003483 |    0.003680 |  0.003706 |             27,173,913,043 |
 | 1,000,000,000 |   10 | 10 |  0.019459 |    0.019804 |  0.020066 |             50,494,849,525 |
 | 10,000,000,000 |   10 | 10 |  0.190158 |    0.192444 |  0.193137 |             51,963,168,506 |
+| 100,000,000,000 |   10 | 10 |  1.901580 |    1.924440 |  1.931370 |             51,963,168,506 |
 
 ---
 

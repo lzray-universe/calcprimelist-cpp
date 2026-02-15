@@ -129,6 +129,7 @@ prime-sieve --from A --to B [options]
 
   其他：
   --ml                用 Meissel-Lehmer 做计数（仅 --count）
+  --stest             自动基准测试（1e6..1e11，每点 10 次）
   --test N            对 N 做 Miller-Rabin 素性测试
   --help/-h           打印帮助
 ```
@@ -149,6 +150,9 @@ prime-sieve --from A --to B [options]
 
 # 4) 指定更强的轮因子与更大分段（高吞吐场景）
 ./prime-sieve --to 1e9 --count --wheel 210 --segment 8M --tile 256K --time
+
+# 5) 一键性能基准（自动识别主机信息并输出 Markdown 表）
+./prime-sieve --stest
 ```
 
 ---
@@ -537,10 +541,11 @@ int main() {
 ---
 ## 性能基准（π(x) 计数，多线程）
 
-> 对每个区间上界 `--to ∈ {1e6, 1e7, 1e8, 1e9, 1e10}`，运行
+> 对每个区间上界 `--to ∈ {1e6, 1e7, 1e8, 1e9, 1e10, 1e11}`，运行
 > `prime-sieve --to {N} --count --time` 重复 10 次，统计 **best / median / mean**。
 > Windows 等价命令：`.\prime-sieve.exe --to {N} --count --time`。
 > 注：`--time` 为工具内计时（微秒），若不可用则以外部 wall-clock 计时。具体环境（CPU/内存/OS/编译器）会影响绝对值。
+> 也可直接运行：`prime-sieve --stest` 自动输出同格式表格。
 
 **测试数据（10 次/每点）：**（本表来自 `Intel® Core™ Ultra 7 265K @ P 3.90 / E 3.30 GHz · 20C/20T (8P+12E)` `Microsoft Windows 11 Pro for Workstations, Version 25H2 (OS Build 26220.7052), x64`）
 
@@ -551,6 +556,7 @@ int main() {
 |  100,000,000 |   10 | 10 |  0.003483 |    0.003680 |  0.003706 |             27,173,913,043 |
 | 1,000,000,000 |   10 | 10 |  0.019459 |    0.019804 |  0.020066 |             50,494,849,525 |
 | 10,000,000,000 |   10 | 10 |  0.190158 |    0.192444 |  0.193137 |             51,963,168,506 |
+| 100,000,000,000 |   10 | 10 |  1.901580 |    1.924440 |  1.931370 |             51,963,168,506 |
 
 ---
 
