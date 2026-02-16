@@ -9,7 +9,12 @@
 #include<limits>
 #include<numeric>
 #include<thread>
+#include<type_traits>
 #include<vector>
+
+#if defined(__AVX2__)
+#include<immintrin.h>
+#endif
 
 namespace calcprime{
 namespace{
@@ -638,17 +643,81 @@ std::uint64_t count_with_kernel30_fast(const WheelBitmapKernel&kernel,
 							}
 						}
 
-						for(std::size_t word_idx=0;word_idx<dense_full_words;
-							++word_idx){
-							std::uint64_t dense_word=0ULL;
-							for(auto&run : dense_runs){
-								if(word_idx<run.word_start){
-									continue;
-								}
-								dense_word|=run.pattern->word_masks[run.phase];
-								run.phase=run.pattern->next_phase_word[run.phase];
+						bool all_dense_runs_start_zero=true;
+						for(const auto&run : dense_runs){
+							if(run.word_start!=0){
+								all_dense_runs_start_zero=false;
+								break;
 							}
-							marks_words[word_idx]|=dense_word;
+						}
+
+						if(all_dense_runs_start_zero){
+							std::size_t word_idx=0;
+							for(;word_idx+4<=dense_full_words;word_idx+=4){
+								std::uint64_t dense0=0ULL;
+								std::uint64_t dense1=0ULL;
+								std::uint64_t dense2=0ULL;
+								std::uint64_t dense3=0ULL;
+								for(auto&run : dense_runs){
+									const DensePattern30*pattern=run.pattern;
+									std::uint16_t phase0=run.phase;
+									dense0|=pattern->word_masks[phase0];
+									std::uint16_t phase1=
+										pattern->next_phase_word[phase0];
+									dense1|=pattern->word_masks[phase1];
+									std::uint16_t phase2=
+										pattern->next_phase_word[phase1];
+									dense2|=pattern->word_masks[phase2];
+									std::uint16_t phase3=
+										pattern->next_phase_word[phase2];
+									dense3|=pattern->word_masks[phase3];
+									run.phase=pattern->next_phase_word[phase3];
+								}
+#if defined(__AVX2__)
+								__m256i dense_vec=_mm256_set_epi64x(
+									static_cast<long long>(dense3),
+									static_cast<long long>(dense2),
+									static_cast<long long>(dense1),
+									static_cast<long long>(dense0));
+								__m256i prev=_mm256_loadu_si256(
+									reinterpret_cast<const __m256i*>(
+										marks_words.data()+word_idx));
+								prev=_mm256_or_si256(prev,dense_vec);
+								_mm256_storeu_si256(
+									reinterpret_cast<__m256i*>(
+										marks_words.data()+word_idx),
+									prev);
+#else
+								marks_words[word_idx+0]|=dense0;
+								marks_words[word_idx+1]|=dense1;
+								marks_words[word_idx+2]|=dense2;
+								marks_words[word_idx+3]|=dense3;
+#endif
+							}
+							for(;word_idx<dense_full_words;++word_idx){
+								std::uint64_t dense_word=0ULL;
+								for(auto&run : dense_runs){
+									dense_word|=run.pattern->word_masks[run.phase];
+									run.phase=
+										run.pattern->next_phase_word[run.phase];
+								}
+								marks_words[word_idx]|=dense_word;
+							}
+						}else{
+							for(std::size_t word_idx=0;word_idx<dense_full_words;
+								++word_idx){
+								std::uint64_t dense_word=0ULL;
+								for(auto&run : dense_runs){
+									if(word_idx<run.word_start){
+										continue;
+									}
+									dense_word|=
+										run.pattern->word_masks[run.phase];
+									run.phase=
+										run.pattern->next_phase_word[run.phase];
+								}
+								marks_words[word_idx]|=dense_word;
+							}
 						}
 
 						if(dense_tail_start<block_count){
@@ -698,20 +767,23 @@ std::uint64_t count_with_kernel30_fast(const WheelBitmapKernel&kernel,
 						std::size_t full_words=
 							static_cast<std::size_t>(block_count>>3);
 						if(segment_full){
-							for(std::size_t word_index=0;word_index<full_words;
-								++word_index){
-								local_total+=
-									64ULL-popcount_u64(marks_words[word_index]);
+							if(full_words>0){
+								std::uint64_t ones=popcount_words_u64(
+									marks_words.data(),full_words);
+								local_total+=full_words*64ULL-ones;
 							}
 
-							std::size_t tail_index=full_words<<3;
-							while(tail_index<block_count){
-								std::uint64_t word=marks_words[tail_index>>3];
-								std::uint8_t composite=static_cast<std::uint8_t>(
-									(word>>((tail_index&7u)*8u))&0xFFu);
-								local_total+=static_cast<std::uint64_t>(
-									8U-kPopcnt8Table[composite]);
-								++tail_index;
+							std::size_t tail_blocks=
+								static_cast<std::size_t>(block_count-(full_words<<3));
+							if(tail_blocks>0){
+								std::uint64_t tail_mask=
+									(tail_blocks>=8)
+										?~0ULL
+										:((1ULL<<(tail_blocks*8ULL))-1ULL);
+								std::uint64_t tail_ones=
+									popcount_words_u64_masked(
+										marks_words.data()+full_words,1,tail_mask);
+								local_total+=tail_blocks*8ULL-tail_ones;
 							}
 						}else{
 							std::size_t word_index=0;
@@ -945,16 +1017,88 @@ std::uint64_t count_with_kernel210_fast(const WheelBitmapKernel&kernel,
 						&pattern,idx,static_cast<std::uint16_t>(phase)});
 				}
 
-				for(std::size_t idx=0;idx<block_count;++idx){
-					std::uint64_t dense_mask=0ULL;
-					for(auto&run : dense_runs){
-						if(idx<run.start_idx){
-							continue;
+				if(!dense_runs.empty()){
+					std::sort(dense_runs.begin(),dense_runs.end(),
+							  [](const DenseRun210&lhs,
+								 const DenseRun210&rhs){
+								  return lhs.start_idx<rhs.start_idx;
+							  });
+
+					std::vector<DenseRun210*> active_runs;
+					active_runs.reserve(dense_runs.size());
+					std::size_t next_pending=0;
+					std::size_t idx=0;
+
+					// Prefix: progressively activate runs that start later.
+					while(idx<block_count&&next_pending<dense_runs.size()){
+						while(next_pending<dense_runs.size()&&
+							  dense_runs[next_pending].start_idx<=idx){
+							active_runs.push_back(&dense_runs[next_pending]);
+							++next_pending;
 						}
-						dense_mask|=run.pattern->block_masks[run.phase];
-						run.phase=run.pattern->next_phase_block[run.phase];
+						std::uint64_t dense_mask=0ULL;
+						for(DenseRun210*run : active_runs){
+							dense_mask|=run->pattern->block_masks[run->phase];
+							run->phase=
+								run->pattern->next_phase_block[run->phase];
+						}
+						marks[idx]|=dense_mask;
+						++idx;
 					}
-					marks[idx]|=dense_mask;
+
+					if(next_pending==dense_runs.size()&&!active_runs.empty()){
+						// Steady-state: all dense runs active, process 4 blocks/step.
+						for(;idx+4<=block_count;idx+=4){
+							std::uint64_t dense0=0ULL;
+							std::uint64_t dense1=0ULL;
+							std::uint64_t dense2=0ULL;
+							std::uint64_t dense3=0ULL;
+							for(DenseRun210*run : active_runs){
+								const DensePattern210*pattern=run->pattern;
+								std::uint16_t phase0=run->phase;
+								dense0|=pattern->block_masks[phase0];
+								std::uint16_t phase1=
+									pattern->next_phase_block[phase0];
+								dense1|=pattern->block_masks[phase1];
+								std::uint16_t phase2=
+									pattern->next_phase_block[phase1];
+								dense2|=pattern->block_masks[phase2];
+								std::uint16_t phase3=
+									pattern->next_phase_block[phase2];
+								dense3|=pattern->block_masks[phase3];
+								run->phase=pattern->next_phase_block[phase3];
+							}
+#if defined(__AVX2__)
+							__m256i dense_vec=_mm256_set_epi64x(
+								static_cast<long long>(dense3),
+								static_cast<long long>(dense2),
+								static_cast<long long>(dense1),
+								static_cast<long long>(dense0));
+							__m256i prev=_mm256_loadu_si256(
+								reinterpret_cast<const __m256i*>(
+									marks.data()+idx));
+							prev=_mm256_or_si256(prev,dense_vec);
+							_mm256_storeu_si256(
+								reinterpret_cast<__m256i*>(marks.data()+idx),
+								prev);
+#else
+							marks[idx+0]|=dense0;
+							marks[idx+1]|=dense1;
+							marks[idx+2]|=dense2;
+							marks[idx+3]|=dense3;
+#endif
+						}
+						for(;idx<block_count;++idx){
+							std::uint64_t dense_mask=0ULL;
+							for(DenseRun210*run : active_runs){
+								dense_mask|=
+									run->pattern->block_masks[run->phase];
+								run->phase=
+									run->pattern->next_phase_block[run->phase];
+							}
+							marks[idx]|=dense_mask;
+						}
+					}
 				}
 
 				for(auto&state : states){
@@ -978,26 +1122,68 @@ std::uint64_t count_with_kernel210_fast(const WheelBitmapKernel&kernel,
 				bool segment_full=lower_full&&upper_full;
 
 				if(segment_full){
-					for(std::uint64_t i=0;i<block_count;++i){
-						std::uint64_t composite=
-							marks[static_cast<std::size_t>(i)]&full_mask;
+					if(block_count>0){
+						std::uint64_t ones=popcount_words_u64_masked(
+							marks.data(),static_cast<std::size_t>(block_count),
+							full_mask);
 						local_total+=static_cast<std::uint64_t>(
-							kernel.phase_count-popcount_u64(composite));
+							block_count*static_cast<std::uint64_t>(
+										   kernel.phase_count)-
+							ones);
 					}
 				}else{
-					for(std::uint64_t i=0;i<block_count;++i){
-						std::uint64_t block_index=seg_block_begin+i;
-						std::uint64_t block_base=block_index*kernel.modulus;
-						std::uint64_t valid=build_valid_mask<std::uint64_t>(
-							kernel,block_base,low,to);
-						if(valid==0ULL){
-							continue;
-						}
+					std::size_t first_partial=
+						std::numeric_limits<std::size_t>::max();
+					std::size_t last_partial=
+						std::numeric_limits<std::size_t>::max();
+					if(seg_block_begin==block_begin&&!low_aligned){
+						first_partial=0;
+					}
+					if(seg_block_end==block_end&&!high_aligned&&block_count>0){
+						last_partial=
+							static_cast<std::size_t>(block_count-1ULL);
+					}
 
-						std::uint64_t composite=
-							marks[static_cast<std::size_t>(i)]&valid;
+					std::size_t full_begin=(first_partial==0)?1U:0U;
+					std::size_t full_end=
+						static_cast<std::size_t>(block_count);
+					if(last_partial!=std::numeric_limits<std::size_t>::max()){
+						full_end=last_partial;
+					}
+					if(full_begin<full_end){
+						std::size_t full_blocks=full_end-full_begin;
+						std::uint64_t ones=popcount_words_u64_masked(
+							marks.data()+full_begin,full_blocks,full_mask);
+						local_total+=static_cast<std::uint64_t>(
+							static_cast<std::uint64_t>(full_blocks)*
+								static_cast<std::uint64_t>(
+									kernel.phase_count)-
+							ones);
+					}
+
+					auto count_partial_block=[&](std::size_t idx_partial){
+						std::uint64_t block_index=
+							seg_block_begin+
+							static_cast<std::uint64_t>(idx_partial);
+						std::uint64_t block_base=
+							block_index*kernel.modulus;
+						std::uint64_t valid=
+							build_valid_mask<std::uint64_t>(
+								kernel,block_base,low,to);
+						if(valid==0ULL){
+							return;
+						}
+						std::uint64_t composite=marks[idx_partial]&valid;
 						local_total+=static_cast<std::uint64_t>(
 							popcount_u64(valid)-popcount_u64(composite));
+					};
+
+					if(first_partial!=std::numeric_limits<std::size_t>::max()){
+						count_partial_block(first_partial);
+					}
+					if(last_partial!=std::numeric_limits<std::size_t>::max()&&
+					   last_partial!=first_partial){
+						count_partial_block(last_partial);
 					}
 				}
 			}
@@ -1134,11 +1320,22 @@ std::uint64_t count_with_kernel(const WheelBitmapKernel&kernel,
 				bool segment_full=lower_full&&upper_full;
 
 				if(segment_full){
-					for(std::uint64_t i=0;i<block_count;++i){
-						MarkT composite=static_cast<MarkT>(
-							marks[static_cast<std::size_t>(i)]&full_mask);
+					if constexpr(std::is_same_v<MarkT,std::uint64_t>){
+						std::uint64_t ones=popcount_words_u64_masked(
+							marks.data(),
+							static_cast<std::size_t>(block_count),
+							static_cast<std::uint64_t>(full_mask));
 						local_total+=static_cast<std::uint64_t>(
-							kernel.phase_count-popcount_mark(composite));
+							block_count*static_cast<std::uint64_t>(
+										   kernel.phase_count)-
+							ones);
+					}else{
+						for(std::uint64_t i=0;i<block_count;++i){
+							MarkT composite=static_cast<MarkT>(
+								marks[static_cast<std::size_t>(i)]&full_mask);
+							local_total+=static_cast<std::uint64_t>(
+								kernel.phase_count-popcount_mark(composite));
+						}
 					}
 				}else{
 					for(std::uint64_t i=0;i<block_count;++i){

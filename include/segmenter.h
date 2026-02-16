@@ -27,6 +27,14 @@ SegmentConfig choose_segment_config(const CpuInfo&info,unsigned threads,
 									std::size_t requested_tile_bytes,
 									std::uint64_t range_length);
 
+SegmentConfig choose_worker_segment_config(const CpuInfo&info,
+										   const SegmentConfig&base_config,
+										   unsigned worker_index,
+										   unsigned thread_count,
+										   std::size_t requested_tile_bytes,
+										   std::uint64_t range_span,
+										   CoreSchedulingMode mode);
+
 class SegmentWorkQueue{
   public:
 	SegmentWorkQueue(SieveRange range,const SegmentConfig&config);
@@ -34,11 +42,21 @@ class SegmentWorkQueue{
 	bool next(std::uint64_t&segment_id,std::uint64_t&segment_low,
 			  std::uint64_t&segment_high);
 
+	bool next_chunk(std::uint64_t requested_segments,
+					std::uint64_t&segment_begin_id,
+					std::uint64_t&segment_end_id);
+
+	bool segment_bounds(std::uint64_t segment_id,std::uint64_t&segment_low,
+						std::uint64_t&segment_high) const;
+
+	std::uint64_t total_segments() const{ return total_segments_; }
+
   private:
 	SieveRange range_;
 	SegmentConfig config_;
 	std::atomic<std::uint64_t> next_segment_;
 	std::uint64_t length_;
+	std::uint64_t total_segments_;
 };
 
 } // namespace calcprime

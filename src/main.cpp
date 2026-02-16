@@ -25,6 +25,7 @@
 #include<iomanip>
 #include<iostream>
 #include<limits>
+#include<memory>
 #include<mutex>
 #include<numeric>
 #include<optional>
@@ -56,8 +57,14 @@ struct Options{
 	std::size_t segment_bytes=0;
 	std::size_t tile_bytes=0;
 	std::string output_path;
+	std::string output_index_path;
 	PrimeOutputFormat output_format=PrimeOutputFormat::Text;
 	bool use_zstd=false;
+	std::uint64_t output_group_count=0;
+	std::uint64_t output_group_primes=0;
+	std::uint64_t output_group_range=0;
+	CoreSchedulingMode core_schedule=CoreSchedulingMode::Auto;
+	bool show_progress=false;
 	bool show_time=false;
 	bool show_stats=false;
 	bool use_ml=false;
@@ -266,6 +273,26 @@ Options parse_options(int argc,char**argv){
 				throw std::invalid_argument("--threads requires a value");
 			}
 			opts.threads=static_cast<unsigned>(parse_u64(argv[++i]));
+		}else if(arg=="--core-schedule"){
+			if(i+1>=argc){
+				throw std::invalid_argument("--core-schedule requires a value");
+			}
+			std::string mode=argv[++i];
+			if(mode=="auto"){
+				opts.core_schedule=CoreSchedulingMode::Auto;
+			}else if(mode=="big"){
+				opts.core_schedule=CoreSchedulingMode::BigOnly;
+			}else if(mode=="all"){
+				opts.core_schedule=CoreSchedulingMode::AllCores;
+			}else if(mode=="legacy"){
+				opts.core_schedule=CoreSchedulingMode::Legacy;
+			}else{
+				throw std::invalid_argument("unsupported core-schedule: "+mode);
+			}
+		}else if(arg=="--big-cores"){
+			opts.core_schedule=CoreSchedulingMode::BigOnly;
+		}else if(arg=="--all-cores"){
+			opts.core_schedule=CoreSchedulingMode::AllCores;
 		}else if(arg=="--wheel"){
 			if(i+1>=argc){
 				throw std::invalid_argument("--wheel requires a value");
@@ -295,6 +322,28 @@ Options parse_options(int argc,char**argv){
 				throw std::invalid_argument("--out requires a path");
 			}
 			opts.output_path=argv[++i];
+		}else if(arg=="--out-index"){
+			if(i+1>=argc){
+				throw std::invalid_argument("--out-index requires a path");
+			}
+			opts.output_index_path=argv[++i];
+		}else if(arg=="--out-groups"){
+			if(i+1>=argc){
+				throw std::invalid_argument("--out-groups requires a value");
+			}
+			opts.output_group_count=parse_u64(argv[++i]);
+		}else if(arg=="--out-group-primes"){
+			if(i+1>=argc){
+				throw std::invalid_argument(
+					"--out-group-primes requires a value");
+			}
+			opts.output_group_primes=parse_u64(argv[++i]);
+		}else if(arg=="--out-group-range"){
+			if(i+1>=argc){
+				throw std::invalid_argument(
+					"--out-group-range requires a value");
+			}
+			opts.output_group_range=parse_u64(argv[++i]);
 		}else if(arg=="--out-format"){
 			if(i+1>=argc){
 				throw std::invalid_argument("--out-format requires a value");
@@ -302,6 +351,8 @@ Options parse_options(int argc,char**argv){
 			parse_output_format(opts,argv[++i]);
 		}else if(arg=="--zstd"){
 			opts.use_zstd=true;
+		}else if(arg=="--progress"){
+			opts.show_progress=true;
 		}else if(arg=="--time"){
 			opts.show_time=true;
 		}else if(arg=="--stats"){
@@ -331,13 +382,21 @@ void print_usage(){
 		<<"  --print             Print primes in the interval\n"
 		<<"  --nth K             Find the K-th prime in the interval\n"
 		<<"  --threads N         Override thread count\n"
+		<<"  --core-schedule M   auto|big|all|legacy (default auto)\n"
+		<<"  --big-cores         Alias of --core-schedule big\n"
+		<<"  --all-cores         Alias of --core-schedule all\n"
 		<<"  --wheel 30|210|1155 Select wheel factorisation (default 30)\n"
 		<<"  --segment BYTES     Override segment size\n"
 		<<"  --tile BYTES        Override tile size\n"
 		<<"  --out PATH          Write primes to file\n"
+		<<"  --out-index PATH    Write grouped-export index file path\n"
+		<<"  --out-groups N      Split export into N range groups\n"
+		<<"  --out-group-primes X  Split export by X primes per group\n"
+		<<"  --out-group-range Y  Split export by Y natural numbers per group\n"
 		<<"  --out-format FMT    Output format: text (default), binary, delta16\n"
 		<<"                    Deprecated aliases: zstd, zstd+delta\n"
 		<<"  --zstd              Compress output stream with zstd (if supported)\n"
+		<<"  --progress          Show segment progress and ETA on stderr\n"
 		<<"  --time              Print elapsed time\n"
 		<<"  --stats             Print configuration statistics\n"
 		<<"  --ml                Use Meissel-Lehmer for counting (only with --count)\n"
@@ -385,6 +444,659 @@ std::string format_seconds(double value){
 	oss<<std::fixed<<std::setprecision(6)<<value;
 	return oss.str();
 }
+
+const char*core_schedule_mode_name(CoreSchedulingMode mode){
+	switch(mode){
+	case CoreSchedulingMode::Auto:
+		return "auto";
+	case CoreSchedulingMode::BigOnly:
+		return "big";
+	case CoreSchedulingMode::AllCores:
+		return "all";
+	case CoreSchedulingMode::Legacy:
+		return "legacy";
+	}
+	return "auto";
+}
+
+std::uint64_t saturating_mul_u64(std::uint64_t lhs,std::uint64_t rhs){
+	if(lhs==0||rhs==0){
+		return 0;
+	}
+	if(lhs>std::numeric_limits<std::uint64_t>::max()/rhs){
+		return std::numeric_limits<std::uint64_t>::max();
+	}
+	return lhs*rhs;
+}
+
+struct WorkerSievePlans{
+	SegmentConfig performance_config{};
+	SegmentConfig efficiency_config{};
+	std::uint32_t performance_batch=1;
+	std::uint32_t efficiency_batch=1;
+	bool has_efficiency_workers=false;
+	bool split_tile=false;
+};
+
+WorkerSievePlans build_worker_sieve_plans(const CpuInfo&info,
+										  const SegmentConfig&base_config,
+										  unsigned threads,
+										  std::size_t requested_tile_bytes,
+										  std::uint64_t range_span,
+										  CoreSchedulingMode mode){
+	WorkerSievePlans plans;
+	plans.performance_config=choose_worker_segment_config(
+		info,base_config,0,threads,requested_tile_bytes,range_span,mode);
+	plans.efficiency_config=plans.performance_config;
+	plans.performance_batch=
+		choose_worker_segment_batch(info,0,threads,range_span,mode);
+	plans.efficiency_batch=plans.performance_batch;
+
+	unsigned efficiency_worker_index=threads;
+	for(unsigned worker=0;worker<threads;++worker){
+		if(!is_performance_worker(info,worker,threads,mode)){
+			efficiency_worker_index=worker;
+			break;
+		}
+	}
+	if(efficiency_worker_index<threads){
+		plans.has_efficiency_workers=true;
+		plans.efficiency_config=choose_worker_segment_config(
+			info,base_config,efficiency_worker_index,threads,
+			requested_tile_bytes,range_span,mode);
+		plans.efficiency_batch=choose_worker_segment_batch(
+			info,efficiency_worker_index,threads,range_span,mode);
+	}
+	plans.split_tile=
+		plans.has_efficiency_workers&&
+		(plans.performance_config.tile_bytes!=plans.efficiency_config.tile_bytes);
+	return plans;
+}
+
+void print_schedule_stats(const CpuInfo&info,unsigned threads,
+						  CoreSchedulingMode core_schedule,
+						  const SegmentConfig&base_config,
+						  const WorkerSievePlans&plans){
+	std::cout<<"Threads: "<<threads<<"\n";
+	std::cout<<"Core schedule: "<<core_schedule_mode_name(core_schedule)<<"\n";
+	if(info.has_hybrid){
+		std::cout<<"Hybrid cores (logical): P="<<info.performance_logical_cpus
+				 <<" E="<<info.efficiency_logical_cpus<<"\n";
+	}
+	std::cout<<"Segment bytes: "<<base_config.segment_bytes<<"\n";
+	if(plans.split_tile){
+		std::cout<<"Tile bytes (P/E): "<<plans.performance_config.tile_bytes
+				 <<'/'<<plans.efficiency_config.tile_bytes<<"\n";
+	}else{
+		std::cout<<"Tile bytes: "<<base_config.tile_bytes<<"\n";
+	}
+	if(plans.has_efficiency_workers){
+		std::uint64_t perf_effective=saturating_mul_u64(
+			static_cast<std::uint64_t>(base_config.segment_bytes),
+			plans.performance_batch);
+		std::uint64_t eff_effective=saturating_mul_u64(
+			static_cast<std::uint64_t>(base_config.segment_bytes),
+			plans.efficiency_batch);
+		std::cout<<"Effective segment bytes (P/E): "<<perf_effective<<'/'
+				 <<eff_effective<<"\n";
+	}
+	std::cout<<"L1d: "<<info.l1_data_bytes<<"  L2: "<<info.l2_bytes<<"\n";
+	if(info.has_hybrid){
+		std::cout<<"L1d (P/E): "<<info.performance_l1_data_bytes<<'/'
+				 <<info.efficiency_l1_data_bytes<<"\n";
+		std::cout<<"L2 (P/E): "<<info.performance_l2_bytes<<'/'
+				 <<info.efficiency_l2_bytes<<"\n";
+	}
+}
+
+std::string format_hms(double seconds){
+	if(!std::isfinite(seconds)||seconds<0.0){
+		return "--:--:--";
+	}
+	std::uint64_t rounded=static_cast<std::uint64_t>(seconds+0.5);
+	std::uint64_t hours=rounded/3600ULL;
+	std::uint64_t minutes=(rounded/60ULL)%60ULL;
+	std::uint64_t secs=rounded%60ULL;
+	std::ostringstream oss;
+	oss<<std::setfill('0')<<std::setw(2)<<hours<<':'<<std::setw(2)
+	   <<minutes<<':'<<std::setw(2)<<secs;
+	return oss.str();
+}
+
+class ProgressReporter{
+  public:
+	ProgressReporter(bool enabled,std::size_t total_segments)
+		: enabled_(enabled&&total_segments>0),total_segments_(total_segments),
+		  start_time_(std::chrono::steady_clock::now()){}
+
+	~ProgressReporter(){
+		try{
+			stop();
+		}catch(...){
+			// Avoid exceptions escaping destructors.
+		}
+	}
+
+	void start(){
+		if(!enabled_||worker_.joinable()){
+			return;
+		}
+		worker_=std::thread([this](){ run(); });
+	}
+
+	void on_segment_complete(){
+		if(!enabled_){
+			return;
+		}
+		segments_processed_.fetch_add(1,std::memory_order_relaxed);
+	}
+
+	void stop(){
+		if(!enabled_){
+			return;
+		}
+		stop_requested_.store(true,std::memory_order_release);
+		if(worker_.joinable()){
+			worker_.join();
+		}else{
+			render(true);
+		}
+		enabled_=false;
+	}
+
+  private:
+	void run(){
+		while(!stop_requested_.load(std::memory_order_acquire)){
+			render(false);
+			std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		}
+		render(true);
+	}
+
+	void render(bool final_line){
+		std::size_t processed=
+			segments_processed_.load(std::memory_order_relaxed);
+		if(processed>total_segments_){
+			processed=total_segments_;
+		}
+
+		double progress=
+			total_segments_==0
+				?1.0
+				:static_cast<double>(processed)/
+					   static_cast<double>(total_segments_);
+		progress=std::clamp(progress,0.0,1.0);
+
+		double elapsed_seconds=std::chrono::duration<double>(
+								   std::chrono::steady_clock::now()-start_time_)
+								   .count();
+		double eta_seconds=0.0;
+		bool has_eta=(progress>0.0&&progress<1.0);
+		if(has_eta){
+			eta_seconds=elapsed_seconds*(1.0-progress)/progress;
+		}
+
+		std::string eta_text=has_eta?format_hms(eta_seconds):"00:00:00";
+		std::string elapsed_text=format_hms(elapsed_seconds);
+
+		char buffer[192];
+		std::snprintf(
+			buffer,sizeof(buffer),
+			"[progress] %6.2f%%  %zu/%zu segments  ETA %s  elapsed %s",
+			progress*100.0,processed,total_segments_,eta_text.c_str(),
+			elapsed_text.c_str());
+		std::string line(buffer);
+
+		std::lock_guard<std::mutex> lock(output_mutex_);
+		std::size_t padding=0;
+		if(last_line_width_>line.size()){
+			padding=last_line_width_-line.size();
+		}
+		std::fprintf(stderr,"\r%s",line.c_str());
+		if(padding>0){
+			std::fprintf(stderr,"%*s",static_cast<int>(padding),"");
+		}
+		if(final_line){
+			std::fprintf(stderr,"\n");
+		}
+		std::fflush(stderr);
+		last_line_width_=line.size();
+	}
+
+	bool enabled_=false;
+	std::size_t total_segments_=0;
+	std::atomic<std::size_t> segments_processed_{0};
+	std::atomic<bool> stop_requested_{false};
+	std::chrono::steady_clock::time_point start_time_{};
+	std::thread worker_;
+	std::mutex output_mutex_;
+	std::size_t last_line_width_=0;
+};
+
+enum class OutputGroupingMode{
+	None,
+	ByGroupCount,
+	ByPrimeCount,
+	ByNaturalRange,
+};
+
+struct OutputGroupingConfig{
+	OutputGroupingMode mode=OutputGroupingMode::None;
+	std::uint64_t value=0;
+	std::string index_path;
+};
+
+constexpr std::uint64_t kMaxGroupedExportFiles=1000000ULL;
+
+std::size_t decimal_width_u64(std::uint64_t value){
+	std::size_t width=1;
+	while(value>=10){
+		value/=10;
+		++width;
+	}
+	return width;
+}
+
+std::string sanitize_tsv_field(std::string value){
+	for(char&ch : value){
+		if(ch=='\t'||ch=='\r'||ch=='\n'){
+			ch=' ';
+		}
+	}
+	return value;
+}
+
+struct OutputPathParts{
+	std::string directory;
+	std::string stem;
+	std::string extension;
+};
+
+OutputPathParts split_output_path(const std::string&path){
+	OutputPathParts parts;
+	std::size_t slash=path.find_last_of("/\\");
+	std::size_t stem_begin=(slash==std::string::npos)?0:(slash+1);
+	if(stem_begin>0){
+		parts.directory=path.substr(0,stem_begin);
+	}
+
+	std::size_t dot=path.find_last_of('.');
+	if(dot==std::string::npos||dot<=stem_begin){
+		parts.stem=path.substr(stem_begin);
+		parts.extension.clear();
+	}else{
+		parts.stem=path.substr(stem_begin,dot-stem_begin);
+		parts.extension=path.substr(dot);
+	}
+	if(parts.stem.empty()){
+		parts.stem="primes";
+	}
+	return parts;
+}
+
+std::uint64_t add_clamped_u64(std::uint64_t value,std::uint64_t delta,
+							  std::uint64_t upper_bound){
+	if(value>=upper_bound){
+		return upper_bound;
+	}
+	std::uint64_t remain=upper_bound-value;
+	if(delta>=remain){
+		return upper_bound;
+	}
+	return value+delta;
+}
+
+class GroupedPrimeExporter{
+  public:
+	GroupedPrimeExporter(const std::string&base_output_path,
+						 PrimeOutputFormat output_format,bool use_zstd,
+						 std::uint64_t range_from,std::uint64_t range_to,
+						 const OutputGroupingConfig&config)
+		: base_output_path_(base_output_path),
+		  index_path_(config.index_path.empty()
+						  ?(base_output_path+".index.tsv")
+						  :config.index_path),
+		  output_format_(output_format),use_zstd_(use_zstd),
+		  range_from_(range_from),range_to_(range_to),mode_(config.mode){
+		if(base_output_path_.empty()){
+			throw std::invalid_argument("grouped export requires --out PATH");
+		}
+		if(mode_==OutputGroupingMode::None){
+			throw std::invalid_argument("invalid grouped export mode");
+		}
+		if(range_to_<=range_from_){
+			throw std::invalid_argument("invalid grouped export range");
+		}
+		path_parts_=split_output_path(base_output_path_);
+
+		switch(mode_){
+		case OutputGroupingMode::ByGroupCount:{
+			if(config.value==0){
+				throw std::invalid_argument("--out-groups must be > 0");
+			}
+			total_groups_=config.value;
+			if(total_groups_>kMaxGroupedExportFiles){
+				throw std::invalid_argument("group count too large");
+			}
+			std::uint64_t total_span=range_to_-range_from_;
+			group_base_span_=total_span/total_groups_;
+			group_remainder_=total_span%total_groups_;
+			break;
+		}
+		case OutputGroupingMode::ByNaturalRange:{
+			if(config.value==0){
+				throw std::invalid_argument("--out-group-range must be > 0");
+			}
+			group_span_=config.value;
+			std::uint64_t total_span=range_to_-range_from_;
+			total_groups_=total_span/group_span_+
+						  ((total_span%group_span_)!=0ULL?1ULL:0ULL);
+			if(total_groups_==0){
+				total_groups_=1;
+			}
+			if(total_groups_>kMaxGroupedExportFiles){
+				throw std::invalid_argument("group count too large");
+			}
+			break;
+		}
+		case OutputGroupingMode::ByPrimeCount:{
+			if(config.value==0){
+				throw std::invalid_argument("--out-group-primes must be > 0");
+			}
+			primes_per_group_=config.value;
+			primes_remaining_=primes_per_group_;
+			break;
+		}
+		case OutputGroupingMode::None:
+			break;
+		}
+
+		index_width_=
+			(mode_==OutputGroupingMode::ByPrimeCount)
+				?6
+				:std::max<std::size_t>(4,decimal_width_u64(total_groups_));
+		if(mode_!=OutputGroupingMode::ByPrimeCount){
+			next_group_begin_=range_from_;
+			open_next_range_group();
+		}
+	}
+
+	~GroupedPrimeExporter(){
+		try{
+			finish();
+		}catch(...){
+			// avoid exceptions escaping destructor
+		}
+	}
+
+	void write_segment(const std::vector<std::uint64_t>&primes){
+		if(finished_||primes.empty()){
+			return;
+		}
+		switch(mode_){
+		case OutputGroupingMode::ByPrimeCount:
+			write_by_prime_count(primes);
+			break;
+		case OutputGroupingMode::ByGroupCount:
+		case OutputGroupingMode::ByNaturalRange:
+			write_by_range(primes);
+			break;
+		case OutputGroupingMode::None:
+			break;
+		}
+	}
+
+	void flush(){
+		if(finished_){
+			return;
+		}
+		if(current_writer_){
+			current_writer_->flush();
+		}
+	}
+
+	void finish(){
+		if(finished_){
+			return;
+		}
+
+		close_current_group();
+		if(mode_!=OutputGroupingMode::ByPrimeCount){
+			while(groups_created_<total_groups_){
+				open_next_range_group();
+				close_current_group();
+			}
+		}
+
+		write_index_file();
+		finished_=true;
+	}
+
+  private:
+	struct GroupIndexRecord{
+		std::uint64_t id=0;
+		std::string file_path;
+		std::uint64_t range_begin=0;
+		std::uint64_t range_end=0;
+		std::uint64_t prime_count=0;
+		std::uint64_t first_prime=0;
+		std::uint64_t last_prime=0;
+		bool has_prime=false;
+	};
+
+	static constexpr std::size_t kNoCurrentGroup=
+		std::numeric_limits<std::size_t>::max();
+
+	void write_by_prime_count(const std::vector<std::uint64_t>&primes){
+		std::size_t offset=0;
+		while(offset<primes.size()){
+			if(!current_writer_){
+				open_group(0,0);
+			}
+			std::size_t remain=primes.size()-offset;
+			std::size_t take=remain;
+			if(primes_remaining_<static_cast<std::uint64_t>(take)){
+				take=static_cast<std::size_t>(primes_remaining_);
+			}
+			write_slice_to_current(primes,offset,take);
+			offset+=take;
+			primes_remaining_-=static_cast<std::uint64_t>(take);
+			if(primes_remaining_==0){
+				close_current_group();
+			}
+		}
+	}
+
+	void write_by_range(const std::vector<std::uint64_t>&primes){
+		std::size_t offset=0;
+		while(offset<primes.size()){
+			ensure_range_group_for_value(primes[offset]);
+			const GroupIndexRecord&current=records_[current_group_index_];
+			std::size_t end=offset+1;
+			while(end<primes.size()&&primes[end]<current.range_end){
+				++end;
+			}
+			write_slice_to_current(primes,offset,end-offset);
+			offset=end;
+		}
+	}
+
+	void ensure_range_group_for_value(std::uint64_t value){
+		while(true){
+			if(!current_writer_){
+				if(groups_created_>=total_groups_){
+					throw std::runtime_error(
+						"group export range exhausted unexpectedly");
+				}
+				open_next_range_group();
+			}
+			const GroupIndexRecord&current=records_[current_group_index_];
+			if(value<current.range_end){
+				return;
+			}
+			close_current_group();
+			if(groups_created_>=total_groups_){
+				throw std::runtime_error(
+					"group export range exhausted unexpectedly");
+			}
+			open_next_range_group();
+		}
+	}
+
+	void open_next_range_group(){
+		if(groups_created_>=total_groups_){
+			return;
+		}
+		std::uint64_t group_begin=next_group_begin_;
+		std::uint64_t group_size=group_span_;
+		if(mode_==OutputGroupingMode::ByGroupCount){
+			group_size=group_base_span_;
+			if(groups_created_<group_remainder_){
+				++group_size;
+			}
+		}
+		std::uint64_t group_end=
+			add_clamped_u64(group_begin,group_size,range_to_);
+		if(groups_created_+1>=total_groups_){
+			group_end=range_to_;
+		}
+		if(group_end<group_begin){
+			group_end=range_to_;
+		}
+		if(group_end==group_begin&&group_end<range_to_){
+			group_end=group_begin+1;
+		}
+		open_group(group_begin,group_end);
+		next_group_begin_=group_end;
+		++groups_created_;
+	}
+
+	void open_group(std::uint64_t group_begin,std::uint64_t group_end){
+		std::uint64_t id=static_cast<std::uint64_t>(records_.size())+1ULL;
+		std::string file_path=build_group_file_path(id);
+		current_writer_=std::make_unique<PrimeWriter>(
+			true,file_path,output_format_,use_zstd_);
+		GroupIndexRecord record;
+		record.id=id;
+		record.file_path=file_path;
+		record.range_begin=group_begin;
+		record.range_end=group_end;
+		records_.push_back(std::move(record));
+		current_group_index_=records_.size()-1;
+		if(mode_==OutputGroupingMode::ByPrimeCount){
+			primes_remaining_=primes_per_group_;
+		}
+	}
+
+	void close_current_group(){
+		if(!current_writer_){
+			return;
+		}
+		current_writer_->flush();
+		current_writer_->finish();
+		current_writer_.reset();
+		current_group_index_=kNoCurrentGroup;
+	}
+
+	void write_slice_to_current(const std::vector<std::uint64_t>&primes,
+								std::size_t offset,std::size_t count){
+		if(count==0||!current_writer_||current_group_index_==kNoCurrentGroup){
+			return;
+		}
+		if(offset==0&&count==primes.size()){
+			current_writer_->write_segment(primes);
+		}else{
+			scratch_.assign(primes.begin()+
+								static_cast<std::ptrdiff_t>(offset),
+							primes.begin()+static_cast<std::ptrdiff_t>(offset+
+															   count));
+			current_writer_->write_segment(scratch_);
+		}
+
+		GroupIndexRecord&record=records_[current_group_index_];
+		std::uint64_t first=primes[offset];
+		std::uint64_t last=primes[offset+count-1];
+		record.prime_count+=static_cast<std::uint64_t>(count);
+		if(!record.has_prime){
+			record.first_prime=first;
+			record.has_prime=true;
+		}
+		record.last_prime=last;
+		if(mode_==OutputGroupingMode::ByPrimeCount){
+			record.range_begin=record.first_prime;
+			record.range_end=
+				(record.last_prime==
+				 std::numeric_limits<std::uint64_t>::max())
+					?std::numeric_limits<std::uint64_t>::max()
+					:(record.last_prime+1ULL);
+		}
+	}
+
+	std::string build_group_file_path(std::uint64_t id) const{
+		std::ostringstream oss;
+		oss<<path_parts_.directory<<path_parts_.stem<<".g"<<std::setfill('0')
+		   <<std::setw(static_cast<int>(index_width_))<<id
+		   <<path_parts_.extension;
+		return oss.str();
+	}
+
+	void write_index_file() const{
+		std::ofstream index_file(index_path_,std::ios::out|std::ios::trunc);
+		if(!index_file){
+			throw std::runtime_error("failed to open index file: "+index_path_);
+		}
+
+		index_file
+			<<"group_id\tfile_path\tgroup_from\tgroup_to\tprime_count\t"
+			<<"first_prime\tlast_prime\n";
+		for(const GroupIndexRecord&record : records_){
+			index_file<<record.id<<'\t'
+					  <<sanitize_tsv_field(record.file_path)<<'\t'
+					  <<record.range_begin<<'\t'<<record.range_end<<'\t'
+					  <<record.prime_count<<'\t';
+			if(record.has_prime){
+				index_file<<record.first_prime;
+			}else{
+				index_file<<'-';
+			}
+			index_file<<'\t';
+			if(record.has_prime){
+				index_file<<record.last_prime;
+			}else{
+				index_file<<'-';
+			}
+			index_file<<'\n';
+		}
+		if(!index_file){
+			throw std::runtime_error("failed to write index file: "+index_path_);
+		}
+	}
+
+	std::string base_output_path_;
+	std::string index_path_;
+	OutputPathParts path_parts_;
+	PrimeOutputFormat output_format_=PrimeOutputFormat::Text;
+	bool use_zstd_=false;
+	std::uint64_t range_from_=0;
+	std::uint64_t range_to_=0;
+	OutputGroupingMode mode_=OutputGroupingMode::None;
+
+	std::uint64_t total_groups_=0;
+	std::uint64_t groups_created_=0;
+	std::uint64_t group_span_=0;
+	std::uint64_t group_base_span_=0;
+	std::uint64_t group_remainder_=0;
+	std::uint64_t next_group_begin_=0;
+	std::uint64_t primes_per_group_=0;
+	std::uint64_t primes_remaining_=0;
+	std::size_t index_width_=6;
+	bool finished_=false;
+
+	std::unique_ptr<PrimeWriter> current_writer_;
+	std::vector<GroupIndexRecord> records_;
+	std::size_t current_group_index_=kNoCurrentGroup;
+	std::vector<std::uint64_t> scratch_;
+};
 
 double median_seconds(std::vector<double>samples){
 	if(samples.empty()){
@@ -663,7 +1375,10 @@ TimedCountResult run_timed_count_once(const Options&opts,const CpuInfo&info,
 		throw std::invalid_argument("invalid range");
 	}
 
-	unsigned threads=opts.threads?opts.threads:effective_thread_count(info);
+	std::uint64_t span=
+		(upper_bound>opts.from)?(upper_bound-opts.from):0ULL;
+	unsigned threads=
+		choose_thread_count(info,opts.threads,span,opts.core_schedule);
 	if(threads==0){
 		threads=1;
 	}
@@ -684,6 +1399,8 @@ TimedCountResult run_timed_count_once(const Options&opts,const CpuInfo&info,
 	std::uint64_t length=(range.end>range.begin)?(range.end-range.begin):0;
 	SegmentConfig config=choose_segment_config(
 		info,threads,opts.segment_bytes,opts.tile_bytes,length);
+	WorkerSievePlans worker_plans=build_worker_sieve_plans(
+		info,config,threads,opts.tile_bytes,span,opts.core_schedule);
 
 	const Wheel&wheel=get_wheel(opts.wheel);
 	std::uint32_t small_limit=19u;
@@ -704,8 +1421,6 @@ TimedCountResult run_timed_count_once(const Options&opts,const CpuInfo&info,
 	auto start_time=std::chrono::steady_clock::now();
 
 	bool can_wheel_bitmap=supports_wheel_bitmap_count(opts.wheel);
-	std::uint64_t span=
-		(upper_bound>opts.from)?(upper_bound-opts.from):0ULL;
 	bool auto_wheel_bitmap=
 		can_wheel_bitmap&&!opts.use_wheel_bitmap&&
 		opts.segment_bytes==0&&opts.wheel==WheelType::Mod30&&
@@ -726,8 +1441,15 @@ TimedCountResult run_timed_count_once(const Options&opts,const CpuInfo&info,
 			total,static_cast<std::uint64_t>(std::max<std::int64_t>(elapsed,0))};
 	}
 
-	PrimeMarker marker(wheel,config,range.begin,range.end,base_primes,
-					   small_limit);
+	PrimeMarker performance_marker(wheel,worker_plans.performance_config,
+								   range.begin,range.end,base_primes,
+								   small_limit);
+	std::unique_ptr<PrimeMarker> efficiency_marker;
+	if(worker_plans.has_efficiency_workers&&worker_plans.split_tile){
+		efficiency_marker=std::make_unique<PrimeMarker>(
+			wheel,worker_plans.efficiency_config,range.begin,range.end,
+			base_primes,small_limit);
+	}
 	SegmentWorkQueue queue(range,config);
 
 	std::vector<std::thread> workers;
@@ -747,20 +1469,37 @@ TimedCountResult run_timed_count_once(const Options&opts,const CpuInfo&info,
 	std::atomic<std::uint64_t> total{prefix_count};
 	for(unsigned t=0;t<threads;++t){
 		workers.emplace_back([&,t](){
-			auto state=marker.make_thread_state(t,threads);
+			bool performance_worker=
+				is_performance_worker(info,t,threads,opts.core_schedule);
+			const PrimeMarker&worker_marker=
+				(efficiency_marker&&!performance_worker)
+					?*efficiency_marker
+					:performance_marker;
+			auto state=worker_marker.make_thread_state(t,threads);
 			std::vector<std::uint64_t> bitset;
 			std::uint64_t local_total=0;
+			const std::uint32_t batch_segments=performance_worker
+												   ?worker_plans.performance_batch
+												   :worker_plans.efficiency_batch;
 			while(true){
-				std::uint64_t segment_id=0;
-				std::uint64_t seg_low=0;
-				std::uint64_t seg_high=0;
-				if(!queue.next(segment_id,seg_low,seg_high)){
+				std::uint64_t segment_begin=0;
+				std::uint64_t segment_end=0;
+				if(!queue.next_chunk(batch_segments,segment_begin,segment_end)){
 					break;
 				}
-				marker.sieve_segment(state,segment_id,seg_low,seg_high,bitset);
-				std::size_t bit_count=
-					static_cast<std::size_t>((seg_high-seg_low)>>1);
-				local_total+=count_zero_bits(bitset.data(),bit_count);
+				for(std::uint64_t segment_id=segment_begin;
+					segment_id<segment_end;++segment_id){
+					std::uint64_t seg_low=0;
+					std::uint64_t seg_high=0;
+					if(!queue.segment_bounds(segment_id,seg_low,seg_high)){
+						continue;
+					}
+					worker_marker.sieve_segment(state,segment_id,seg_low,
+												seg_high,bitset);
+					std::size_t bit_count=
+						static_cast<std::size_t>((seg_high-seg_low)>>1);
+					local_total+=count_zero_bits(bitset.data(),bit_count);
+				}
 			}
 			total.fetch_add(local_total,std::memory_order_relaxed);
 		});
@@ -888,9 +1627,51 @@ int run_cli(int argc,char**argv){
 		if(opts.to<=opts.from||opts.to<2){
 			throw std::invalid_argument("invalid range");
 		}
+		OutputGroupingConfig grouping_config;
+		std::size_t grouping_mode_count=0;
+		if(opts.output_group_count!=0){
+			grouping_config.mode=OutputGroupingMode::ByGroupCount;
+			grouping_config.value=opts.output_group_count;
+			++grouping_mode_count;
+		}
+		if(opts.output_group_primes!=0){
+			grouping_config.mode=OutputGroupingMode::ByPrimeCount;
+			grouping_config.value=opts.output_group_primes;
+			++grouping_mode_count;
+		}
+		if(opts.output_group_range!=0){
+			grouping_config.mode=OutputGroupingMode::ByNaturalRange;
+			grouping_config.value=opts.output_group_range;
+			++grouping_mode_count;
+		}
+		if(grouping_mode_count>1){
+			throw std::invalid_argument(
+				"--out-groups/--out-group-primes/--out-group-range are "
+				"mutually exclusive");
+		}
+		if(grouping_mode_count!=0){
+			if(!opts.print_primes){
+				throw std::invalid_argument(
+					"grouped export requires --print mode");
+			}
+			if(opts.output_path.empty()){
+				throw std::invalid_argument(
+					"grouped export requires --out PATH");
+			}
+			grouping_config.index_path=
+				opts.output_index_path.empty()
+					?(opts.output_path+".index.tsv")
+					:opts.output_index_path;
+		}else if(!opts.output_index_path.empty()){
+			throw std::invalid_argument(
+				"--out-index requires one grouped export option");
+		}
 
 		CpuInfo info=detect_cpu_info();
-		unsigned threads=opts.threads?opts.threads:effective_thread_count(info);
+		std::uint64_t span=
+			(opts.to>opts.from)?(opts.to-opts.from):0ULL;
+		unsigned threads=
+			choose_thread_count(info,opts.threads,span,opts.core_schedule);
 		if(opts.nth.has_value()){
 			threads=1; // ensure deterministic ordering
 		}
@@ -915,6 +1696,8 @@ int run_cli(int argc,char**argv){
 
 		SegmentConfig config=choose_segment_config(
 			info,threads,opts.segment_bytes,opts.tile_bytes,length);
+		WorkerSievePlans worker_plans=build_worker_sieve_plans(
+			info,config,threads,opts.tile_bytes,span,opts.core_schedule);
 		const Wheel&wheel=get_wheel(opts.wheel);
 		std::uint32_t small_limit=19u;
 		switch(opts.wheel){
@@ -945,17 +1728,19 @@ int run_cli(int argc,char**argv){
 			if(opts.print_primes||opts.nth.has_value()){
 				throw std::invalid_argument("--ml supports count mode only");
 			}
+			if(opts.show_progress){
+				std::fprintf(stderr,
+							 "[calcprime] warning: --progress is not "
+							 "available in --ml mode.\n");
+			}
 			std::uint64_t total=
 				meissel_count(opts.from,opts.to,base_primes,threads);
 			auto end_time=std::chrono::steady_clock::now();
 			std::cout<<total<<"\n";
 
 			if(opts.show_stats){
-				std::cout<<"Threads: "<<threads<<"\n";
-				std::cout<<"Segment bytes: "<<config.segment_bytes<<"\n";
-				std::cout<<"Tile bytes: "<<config.tile_bytes<<"\n";
-				std::cout<<"L1d: "<<info.l1_data_bytes<<"  L2: "<<info.l2_bytes
-						 <<"\n";
+				print_schedule_stats(info,threads,opts.core_schedule,config,
+									 worker_plans);
 			}
 
 			if(opts.show_time){
@@ -971,10 +1756,9 @@ int run_cli(int argc,char**argv){
 		bool can_wheel_bitmap=is_count_mode&&!opts.print_primes&&
 							 !opts.nth.has_value()&&
 							 supports_wheel_bitmap_count(opts.wheel);
-		std::uint64_t span=
-			(opts.to>opts.from)?(opts.to-opts.from):0ULL;
 		bool auto_wheel_bitmap=
 			can_wheel_bitmap&&!opts.use_wheel_bitmap&&
+			!opts.show_progress&&
 			opts.segment_bytes==0&&opts.wheel==WheelType::Mod30&&
 			((threads<=1&&span>=1000000000ULL)||
 			 (threads>1&&span>=8000000000ULL));
@@ -982,6 +1766,11 @@ int run_cli(int argc,char**argv){
 								   (opts.use_wheel_bitmap||auto_wheel_bitmap);
 
 		if(use_wheel_bitmap_path){
+			if(opts.show_progress){
+				std::fprintf(stderr,
+							 "[calcprime] warning: --progress is not "
+							 "available in --wheel-bitmap mode.\n");
+			}
 			std::uint64_t total=count_primes_wheel_bitmap(
 				opts.from,opts.to,threads,opts.wheel,config,base_primes,
 				opts.segment_bytes!=0);
@@ -991,11 +1780,8 @@ int run_cli(int argc,char**argv){
 			if(opts.show_stats){
 				std::cout<<"Wheel bitmap: "
 						 <<(opts.use_wheel_bitmap?"forced":"auto")<<"\n";
-				std::cout<<"Threads: "<<threads<<"\n";
-				std::cout<<"Segment bytes: "<<config.segment_bytes<<"\n";
-				std::cout<<"Tile bytes: "<<config.tile_bytes<<"\n";
-				std::cout<<"L1d: "<<info.l1_data_bytes<<"  L2: "<<info.l2_bytes
-						 <<"\n";
+				print_schedule_stats(info,threads,opts.core_schedule,config,
+									 worker_plans);
 			}
 
 			if(opts.show_time){
@@ -1008,8 +1794,15 @@ int run_cli(int argc,char**argv){
 			return 0;
 		}
 
-		PrimeMarker marker(wheel,config,range.begin,range.end,base_primes,
-						   small_limit);
+		PrimeMarker performance_marker(wheel,worker_plans.performance_config,
+									   range.begin,range.end,base_primes,
+									   small_limit);
+		std::unique_ptr<PrimeMarker> efficiency_marker;
+		if(worker_plans.has_efficiency_workers&&worker_plans.split_tile){
+			efficiency_marker=std::make_unique<PrimeMarker>(
+				wheel,worker_plans.efficiency_config,range.begin,range.end,
+				base_primes,small_limit);
+		}
 		SegmentWorkQueue queue(range,config);
 
 		std::vector<SegmentResult> segment_results(num_segments);
@@ -1042,24 +1835,47 @@ int run_cli(int argc,char**argv){
 		}
 
 		if(is_count_mode&&!opts.print_primes&&!opts.nth.has_value()){
+			ProgressReporter progress(opts.show_progress,num_segments);
+			progress.start();
 			std::atomic<std::uint64_t> total{prefix_count};
 			for(unsigned t=0;t<threads;++t){
 				workers.emplace_back([&,t](){
-					auto state=marker.make_thread_state(t,threads);
+					bool performance_worker=
+						is_performance_worker(info,t,threads,opts.core_schedule);
+					const PrimeMarker&worker_marker=
+						(efficiency_marker&&!performance_worker)
+							?*efficiency_marker
+							:performance_marker;
+					auto state=worker_marker.make_thread_state(t,threads);
 					std::vector<std::uint64_t> bitset;
 					std::uint64_t local_total=0;
+					const std::uint32_t batch_segments=
+						performance_worker?worker_plans.performance_batch
+										  :worker_plans.efficiency_batch;
 					while(true){
-						std::uint64_t segment_id=0;
-						std::uint64_t seg_low=0;
-						std::uint64_t seg_high=0;
-						if(!queue.next(segment_id,seg_low,seg_high)){
+						std::uint64_t segment_begin=0;
+						std::uint64_t segment_end=0;
+						if(!queue.next_chunk(batch_segments,segment_begin,
+											 segment_end)){
 							break;
 						}
-						marker.sieve_segment(state,segment_id,seg_low,seg_high,
-											 bitset);
-						std::size_t bit_count=
-							static_cast<std::size_t>((seg_high-seg_low)>>1);
-						local_total+=count_zero_bits(bitset.data(),bit_count);
+						for(std::uint64_t segment_id=segment_begin;
+							segment_id<segment_end;++segment_id){
+							std::uint64_t seg_low=0;
+							std::uint64_t seg_high=0;
+							if(!queue.segment_bounds(segment_id,seg_low,
+													 seg_high)){
+								continue;
+							}
+							worker_marker.sieve_segment(
+								state,segment_id,seg_low,seg_high,bitset);
+							std::size_t bit_count=
+								static_cast<std::size_t>((seg_high-seg_low)>>
+												 1);
+							local_total+=
+								count_zero_bits(bitset.data(),bit_count);
+							progress.on_segment_complete();
+						}
 					}
 					total.fetch_add(local_total,std::memory_order_relaxed);
 				});
@@ -1067,16 +1883,14 @@ int run_cli(int argc,char**argv){
 			for(auto&th : workers){
 				th.join();
 			}
+			progress.stop();
 
 			auto end_time=std::chrono::steady_clock::now();
 			std::cout<<total.load(std::memory_order_relaxed)<<"\n";
 
 			if(opts.show_stats){
-				std::cout<<"Threads: "<<threads<<"\n";
-				std::cout<<"Segment bytes: "<<config.segment_bytes<<"\n";
-				std::cout<<"Tile bytes: "<<config.tile_bytes<<"\n";
-				std::cout<<"L1d: "<<info.l1_data_bytes<<"  L2: "<<info.l2_bytes
-						 <<"\n";
+				print_schedule_stats(info,threads,opts.core_schedule,config,
+									 worker_plans);
 			}
 
 			if(opts.show_time){
@@ -1090,99 +1904,138 @@ int run_cli(int argc,char**argv){
 			return 0;
 		}
 
-		PrimeWriter writer(opts.print_primes,opts.output_path,
-						   opts.output_format,opts.use_zstd);
+		std::unique_ptr<PrimeWriter> writer;
+		std::unique_ptr<GroupedPrimeExporter> grouped_exporter;
+		if(grouping_config.mode!=OutputGroupingMode::None){
+			grouped_exporter=std::make_unique<GroupedPrimeExporter>(
+				opts.output_path,opts.output_format,opts.use_zstd,opts.from,
+				opts.to,grouping_config);
+		}else{
+			writer=std::make_unique<PrimeWriter>(opts.print_primes,
+											 opts.output_path,
+											 opts.output_format,opts.use_zstd);
+		}
 		std::mutex writer_exception_mutex;
 		std::exception_ptr writer_exception;
 		std::thread writer_feeder;
+		ProgressReporter progress(opts.show_progress,num_segments);
+		progress.start();
 
 		for(unsigned t=0;t<threads;++t){
 			workers.emplace_back([&,t](){
-				auto state=marker.make_thread_state(t,threads);
+				bool performance_worker=
+					is_performance_worker(info,t,threads,opts.core_schedule);
+				const PrimeMarker&worker_marker=
+					(efficiency_marker&&!performance_worker)
+						?*efficiency_marker
+						:performance_marker;
+				auto state=worker_marker.make_thread_state(t,threads);
 				std::vector<std::uint64_t> bitset;
 				std::uint64_t cumulative=prefix_count;
+				const std::uint32_t batch_segments=
+					performance_worker?worker_plans.performance_batch
+									  :worker_plans.efficiency_batch;
 				while(!stop.load(std::memory_order_relaxed)){
-					std::uint64_t segment_id=0;
-					std::uint64_t seg_low=0;
-					std::uint64_t seg_high=0;
-					if(!queue.next(segment_id,seg_low,seg_high)){
+					std::uint64_t segment_begin=0;
+					std::uint64_t segment_end=0;
+					if(!queue.next_chunk(batch_segments,segment_begin,
+										 segment_end)){
 						break;
 					}
-					marker.sieve_segment(state,segment_id,seg_low,seg_high,
-										 bitset);
-					std::size_t bit_count=
-						static_cast<std::size_t>((seg_high-seg_low)>>1);
-					std::uint64_t local_count=
-						count_zero_bits(bitset.data(),bit_count);
-					if(segment_id<segment_results.size()){
-						segment_results[segment_id].count=local_count;
-					}
-					bool need_primes=
-						opts.print_primes||(opts.nth.has_value()&&threads==1);
-					if(need_primes&&segment_id<segment_results.size()){
-						std::vector<std::uint64_t> primes;
-						primes.reserve(static_cast<std::size_t>(local_count));
-						extract_segment_primes(bitset,seg_low,bit_count,primes);
-						segment_results[segment_id].primes=std::move(primes);
-						{
-							std::lock_guard<std::mutex> lock(
-								segment_ready_mutex);
-							segment_results[segment_id].ready.store(
-								true,std::memory_order_release);
+					for(std::uint64_t segment_id=segment_begin;
+						segment_id<segment_end;++segment_id){
+						if(stop.load(std::memory_order_relaxed)){
+							break;
 						}
-						segment_ready_cv.notify_one();
-						if(opts.nth.has_value()&&threads==1&&
-						   !nth_found.load(std::memory_order_relaxed)){
-							std::uint64_t base=cumulative;
-							std::uint64_t new_total=base+local_count;
-							if(nth_target>base&&nth_target<=new_total){
-								std::size_t index=
-									static_cast<std::size_t>(nth_target-base-1);
-								if(index<
-								   segment_results[segment_id].primes.size()){
-									nth_value=segment_results[segment_id]
-												  .primes[index];
-									nth_found.store(true,
-													std::memory_order_relaxed);
-									stop.store(true,std::memory_order_relaxed);
-								}
+						std::uint64_t seg_low=0;
+						std::uint64_t seg_high=0;
+						if(!queue.segment_bounds(segment_id,seg_low,seg_high)){
+							continue;
+						}
+						worker_marker.sieve_segment(state,segment_id,seg_low,
+													seg_high,bitset);
+						std::size_t bit_count=
+							static_cast<std::size_t>((seg_high-seg_low)>>1);
+						std::uint64_t local_count=
+							count_zero_bits(bitset.data(),bit_count);
+						if(segment_id<segment_results.size()){
+							segment_results[segment_id].count=local_count;
+						}
+						bool need_primes=
+							opts.print_primes||
+							(opts.nth.has_value()&&threads==1);
+						if(need_primes&&segment_id<segment_results.size()){
+							std::vector<std::uint64_t> primes;
+							primes.reserve(static_cast<std::size_t>(local_count));
+							extract_segment_primes(bitset,seg_low,bit_count,
+												   primes);
+							segment_results[segment_id].primes=
+								std::move(primes);
+							{
+								std::lock_guard<std::mutex> lock(
+									segment_ready_mutex);
+								segment_results[segment_id].ready.store(
+									true,std::memory_order_release);
 							}
-							cumulative=new_total;
-						}
-					}else{
-						if(opts.nth.has_value()&&threads==1&&
-						   !nth_found.load(std::memory_order_relaxed)){
-							std::uint64_t base=cumulative;
-							std::uint64_t new_total=base+local_count;
-							if(nth_target>base&&nth_target<=new_total){
-								// Need to extract primes to find nth
-								std::vector<std::uint64_t> primes;
-								primes.reserve(
-									static_cast<std::size_t>(local_count));
-								extract_segment_primes(bitset,seg_low,bit_count,
-													   primes);
-								std::size_t index=
-									static_cast<std::size_t>(nth_target-base-1);
-								if(index<primes.size()){
-									nth_value=primes[index];
-									nth_found.store(true,
-													std::memory_order_relaxed);
-									stop.store(true,std::memory_order_relaxed);
-								}
-								if(segment_id<segment_results.size()){
-									segment_results[segment_id].primes=
-										std::move(primes);
-									{
-										std::lock_guard<std::mutex> lock(
-											segment_ready_mutex);
-										segment_results[segment_id].ready.store(
-											true,std::memory_order_release);
+							segment_ready_cv.notify_one();
+							if(opts.nth.has_value()&&threads==1&&
+							   !nth_found.load(std::memory_order_relaxed)){
+								std::uint64_t base=cumulative;
+								std::uint64_t new_total=base+local_count;
+								if(nth_target>base&&nth_target<=new_total){
+									std::size_t index=static_cast<std::size_t>(
+										nth_target-base-1);
+									if(index<segment_results[segment_id]
+												   .primes.size()){
+										nth_value=segment_results[segment_id]
+													  .primes[index];
+										nth_found.store(
+											true,std::memory_order_relaxed);
+										stop.store(true,
+												   std::memory_order_relaxed);
 									}
-									segment_ready_cv.notify_one();
 								}
+								cumulative=new_total;
 							}
-							cumulative=new_total;
+						}else{
+							if(opts.nth.has_value()&&threads==1&&
+							   !nth_found.load(std::memory_order_relaxed)){
+								std::uint64_t base=cumulative;
+								std::uint64_t new_total=base+local_count;
+								if(nth_target>base&&nth_target<=new_total){
+									// Need to extract primes to find nth
+									std::vector<std::uint64_t> primes;
+									primes.reserve(
+										static_cast<std::size_t>(local_count));
+									extract_segment_primes(bitset,seg_low,
+														   bit_count,primes);
+									std::size_t index=static_cast<std::size_t>(
+										nth_target-base-1);
+									if(index<primes.size()){
+										nth_value=primes[index];
+										nth_found.store(
+											true,std::memory_order_relaxed);
+										stop.store(true,
+												   std::memory_order_relaxed);
+									}
+									if(segment_id<segment_results.size()){
+										segment_results[segment_id].primes=
+											std::move(primes);
+										{
+											std::lock_guard<std::mutex> lock(
+												segment_ready_mutex);
+											segment_results[segment_id].ready
+												.store(
+													true,
+													std::memory_order_release);
+										}
+										segment_ready_cv.notify_one();
+									}
+								}
+								cumulative=new_total;
+							}
 						}
+						progress.on_segment_complete();
 					}
 				}
 			});
@@ -1193,7 +2046,11 @@ int run_cli(int argc,char**argv){
 			writer_feeder=std::thread([&,prefix_copy]() mutable{
 				try{
 					if(!prefix_copy.empty()){
-						writer.write_segment(prefix_copy);
+						if(grouped_exporter){
+							grouped_exporter->write_segment(prefix_copy);
+						}else if(writer){
+							writer->write_segment(prefix_copy);
+						}
 					}
 					for(std::size_t next=0;next<segment_results.size();++next){
 						SegmentResult&res=segment_results[next];
@@ -1209,9 +2066,17 @@ int run_cli(int argc,char**argv){
 						res.ready.store(false,std::memory_order_relaxed);
 						std::vector<std::uint64_t> primes=std::move(res.primes);
 						lock.unlock();
-						writer.write_segment(primes);
+						if(grouped_exporter){
+							grouped_exporter->write_segment(primes);
+						}else if(writer){
+							writer->write_segment(primes);
+						}
 					}
-					writer.flush();
+					if(grouped_exporter){
+						grouped_exporter->flush();
+					}else if(writer){
+						writer->flush();
+					}
 				}catch(...){
 					std::lock_guard<std::mutex> err_lock(
 						writer_exception_mutex);
@@ -1225,6 +2090,7 @@ int run_cli(int argc,char**argv){
 		for(auto&th : workers){
 			th.join();
 		}
+		progress.stop();
 
 		segment_ready_cv.notify_all();
 
@@ -1250,7 +2116,11 @@ int run_cli(int argc,char**argv){
 		}
 
 		try{
-			writer.finish();
+			if(grouped_exporter){
+				grouped_exporter->finish();
+			}else if(writer){
+				writer->finish();
+			}
 		}catch(...){
 			if(!pending_writer_exception){
 				pending_writer_exception=std::current_exception();
@@ -1270,11 +2140,20 @@ int run_cli(int argc,char**argv){
 		}
 
 		if(opts.show_stats){
-			std::cout<<"Threads: "<<threads<<"\n";
-			std::cout<<"Segment bytes: "<<config.segment_bytes<<"\n";
-			std::cout<<"Tile bytes: "<<config.tile_bytes<<"\n";
-			std::cout<<"L1d: "<<info.l1_data_bytes<<"  L2: "<<info.l2_bytes
-					 <<"\n";
+			print_schedule_stats(info,threads,opts.core_schedule,config,
+								 worker_plans);
+			if(grouping_config.mode==OutputGroupingMode::ByGroupCount){
+				std::cout<<"Grouped export: "<<grouping_config.value
+						 <<" range groups\n";
+			}else if(grouping_config.mode==
+					 OutputGroupingMode::ByPrimeCount){
+				std::cout<<"Grouped export: "<<grouping_config.value
+						 <<" primes/group\n";
+			}else if(grouping_config.mode==
+					 OutputGroupingMode::ByNaturalRange){
+				std::cout<<"Grouped export: "<<grouping_config.value
+						 <<" numbers/group\n";
+			}
 		}
 
 		if(opts.show_time){

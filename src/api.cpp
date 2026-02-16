@@ -467,8 +467,10 @@ calcprime_run_range(const calcprime_range_options*options,
 	calcprime::CpuInfo cpu_info=calcprime::detect_cpu_info();
 	result->stats.cpu=to_c_cpu_info(cpu_info);
 
-	unsigned threads=
-		opts.threads?opts.threads:calcprime::effective_thread_count(cpu_info);
+	std::uint64_t range_span=
+		(opts.to>opts.from)?(opts.to-opts.from):0ULL;
+	unsigned threads=calcprime::choose_thread_count(
+		cpu_info,opts.threads,range_span,calcprime::CoreSchedulingMode::Auto);
 	if(opts.nth_index!=0){
 		threads=1;
 	}
@@ -604,8 +606,44 @@ calcprime_run_range(const calcprime_range_options*options,
 	bool need_segment_storage=need_prime_delivery;
 	bool need_primes_for_nth=opts.nth_index!=0;
 
-	calcprime::PrimeMarker marker(wheel,config,range.begin,range.end,
-								  base_primes,small_limit);
+	const calcprime::CoreSchedulingMode core_schedule=
+		calcprime::CoreSchedulingMode::Auto;
+	calcprime::SegmentConfig performance_config=
+		calcprime::choose_worker_segment_config(
+			cpu_info,config,0,threads,opts.tile_bytes,range_span,
+			core_schedule);
+	calcprime::SegmentConfig efficiency_config=performance_config;
+	std::uint32_t performance_batch=calcprime::choose_worker_segment_batch(
+		cpu_info,0,threads,range_span,core_schedule);
+	std::uint32_t efficiency_batch=performance_batch;
+	bool has_efficiency_workers=false;
+	unsigned efficiency_worker_index=threads;
+	for(unsigned worker=0;worker<threads;++worker){
+		if(!calcprime::is_performance_worker(
+			   cpu_info,worker,threads,core_schedule)){
+			has_efficiency_workers=true;
+			efficiency_worker_index=worker;
+			break;
+		}
+	}
+	if(has_efficiency_workers){
+		efficiency_config=calcprime::choose_worker_segment_config(
+			cpu_info,config,efficiency_worker_index,threads,opts.tile_bytes,
+			range_span,core_schedule);
+		efficiency_batch=calcprime::choose_worker_segment_batch(
+			cpu_info,efficiency_worker_index,threads,range_span,core_schedule);
+	}
+	bool split_tile=has_efficiency_workers&&
+					(performance_config.tile_bytes!=
+					 efficiency_config.tile_bytes);
+	calcprime::PrimeMarker performance_marker(
+		wheel,performance_config,range.begin,range.end,base_primes,small_limit);
+	std::unique_ptr<calcprime::PrimeMarker> efficiency_marker;
+	if(split_tile){
+		efficiency_marker=std::make_unique<calcprime::PrimeMarker>(
+			wheel,efficiency_config,range.begin,range.end,base_primes,
+			small_limit);
+	}
 	calcprime::SegmentWorkQueue queue(range,config);
 
 	std::vector<SegmentResult> segment_results(num_segments);
@@ -725,9 +763,17 @@ calcprime_run_range(const calcprime_range_options*options,
 
 	for(unsigned t=0;t<threads;++t){
 		workers.emplace_back([&,t](){
-			auto state=marker.make_thread_state(t,threads);
+			bool performance_worker=calcprime::is_performance_worker(
+				cpu_info,t,threads,core_schedule);
+			const calcprime::PrimeMarker&worker_marker=
+				(efficiency_marker&&!performance_worker)
+					?*efficiency_marker
+					:performance_marker;
+			auto state=worker_marker.make_thread_state(t,threads);
 			std::vector<std::uint64_t> bitset;
 			std::uint64_t cumulative=prefix_total;
+			const std::uint32_t batch_segments=
+				performance_worker?performance_batch:efficiency_batch;
 			while(!stop.load(std::memory_order_acquire)){
 				if(opts.cancel_token&&opts.cancel_token->cancelled.load(
 										  std::memory_order_acquire)){
@@ -735,112 +781,125 @@ calcprime_run_range(const calcprime_range_options*options,
 					stop.store(true,std::memory_order_release);
 					break;
 				}
-				std::uint64_t segment_id=0;
-				std::uint64_t seg_low=0;
-				std::uint64_t seg_high=0;
-				if(!queue.next(segment_id,seg_low,seg_high)){
+				std::uint64_t segment_begin=0;
+				std::uint64_t segment_end=0;
+				if(!queue.next_chunk(batch_segments,segment_begin,segment_end)){
 					break;
 				}
-				marker.sieve_segment(state,segment_id,seg_low,seg_high,bitset);
-				std::size_t bit_count=
-					static_cast<std::size_t>((seg_high-seg_low)>>1);
-				std::uint64_t local_count=
-					calcprime::count_zero_bits(bitset.data(),bit_count);
-				if(segment_id<segment_results.size()){
-					segment_results[segment_id].count=local_count;
-				}
+				for(std::uint64_t segment_id=segment_begin;
+					segment_id<segment_end;++segment_id){
+					if(stop.load(std::memory_order_acquire)){
+						break;
+					}
+					std::uint64_t seg_low=0;
+					std::uint64_t seg_high=0;
+					if(!queue.segment_bounds(segment_id,seg_low,seg_high)){
+						continue;
+					}
+					worker_marker.sieve_segment(state,segment_id,seg_low,
+												seg_high,bitset);
+					std::size_t bit_count=
+						static_cast<std::size_t>((seg_high-seg_low)>>1);
+					std::uint64_t local_count=
+						calcprime::count_zero_bits(bitset.data(),bit_count);
+					if(segment_id<segment_results.size()){
+						segment_results[segment_id].count=local_count;
+					}
 
-				std::vector<std::uint64_t> primes;
-				bool need_primes=
-					need_segment_storage||(need_primes_for_nth&&threads==1);
-				if(need_primes&&local_count>0){
-					primes.reserve(static_cast<std::size_t>(local_count));
-					std::uint64_t value=seg_low;
-					std::size_t produced=0;
-					for(std::size_t word=0;
-						word<bitset.size()&&produced<bit_count;++word){
-						std::uint64_t composite=bitset[word];
-						for(std::size_t bit=0;bit<64&&produced<bit_count;
-							++bit,++produced,value+=2){
-							if(composite&(1ULL<<bit)){
-								continue;
+					std::vector<std::uint64_t> primes;
+					bool need_primes=
+						need_segment_storage||(need_primes_for_nth&&threads==1);
+					if(need_primes&&local_count>0){
+						primes.reserve(static_cast<std::size_t>(local_count));
+						std::uint64_t value=seg_low;
+						std::size_t produced=0;
+						for(std::size_t word=0;
+							word<bitset.size()&&produced<bit_count;++word){
+							std::uint64_t composite=bitset[word];
+							for(std::size_t bit=0;bit<64&&produced<bit_count;
+								++bit,++produced,value+=2){
+								if(composite&(1ULL<<bit)){
+									continue;
+								}
+								primes.push_back(value);
 							}
-							primes.push_back(value);
 						}
 					}
-				}
 
-				if(need_primes_for_nth&&threads==1&&
-				   !nth_found_flag.load(std::memory_order_acquire)){
-					std::uint64_t base=cumulative;
-					std::uint64_t new_total=base+local_count;
-					if(nth_target>base&&nth_target<=new_total){
-						if(primes.empty()&&local_count>0){
-							primes.reserve(
-								static_cast<std::size_t>(local_count));
-							std::uint64_t value=seg_low;
-							std::size_t produced=0;
-							for(std::size_t word=0;
-								word<bitset.size()&&produced<bit_count;++word){
-								std::uint64_t composite=bitset[word];
-								for(std::size_t bit=0;
-									bit<64&&produced<bit_count;
-									++bit,++produced,value+=2){
-									if(composite&(1ULL<<bit)){
-										continue;
+					if(need_primes_for_nth&&threads==1&&
+					   !nth_found_flag.load(std::memory_order_acquire)){
+						std::uint64_t base=cumulative;
+						std::uint64_t new_total=base+local_count;
+						if(nth_target>base&&nth_target<=new_total){
+							if(primes.empty()&&local_count>0){
+								primes.reserve(
+									static_cast<std::size_t>(local_count));
+								std::uint64_t value=seg_low;
+								std::size_t produced=0;
+								for(std::size_t word=0;
+									word<bitset.size()&&produced<bit_count;
+									++word){
+									std::uint64_t composite=bitset[word];
+									for(std::size_t bit=0;
+										bit<64&&produced<bit_count;
+										++bit,++produced,value+=2){
+										if(composite&(1ULL<<bit)){
+											continue;
+										}
+										primes.push_back(value);
 									}
-									primes.push_back(value);
 								}
 							}
-						}
-						std::size_t index=
-							static_cast<std::size_t>(nth_target-base-1);
-						if(index<primes.size()){
-							nth_value=primes[index];
-							nth_found_flag.store(true,
-												 std::memory_order_release);
-							stop.store(true,std::memory_order_release);
-						}
-					}
-					cumulative=new_total;
-				}
-
-				if(need_segment_storage&&segment_id<segment_results.size()){
-					segment_results[segment_id].primes=std::move(primes);
-					segment_results[segment_id].ready.store(
-						true,std::memory_order_release);
-					segment_ready_cv.notify_all();
-				}
-
-				std::size_t completed=
-					segments_processed.fetch_add(1,std::memory_order_acq_rel)+1;
-				if(opts.progress_callback&&!progress_cancelled){
-					std::lock_guard<std::mutex> lock(progress_mutex);
-					if(!progress_cancelled){
-						double progress_value=
-							(num_segments==0)
-								?1.0
-								:static_cast<double>(completed)/
-									 static_cast<double>(num_segments);
-						if(progress_value>1.0){
-							progress_value=1.0;
-						}
-						int progress_result=0;
-						try{
-							progress_result=opts.progress_callback(
-								progress_value,opts.progress_user_data);
-						}catch(...){
-							if(failure_kind==FailureKind::None){
-								failure_kind=FailureKind::Progress;
-								stored_exception=std::current_exception();
+							std::size_t index=
+								static_cast<std::size_t>(nth_target-base-1);
+							if(index<primes.size()){
+								nth_value=primes[index];
+								nth_found_flag.store(
+									true,std::memory_order_release);
+								stop.store(true,std::memory_order_release);
 							}
-							progress_cancelled=true;
-							stop.store(true,std::memory_order_release);
-							break;
 						}
-						if(progress_result!=0){
-							progress_cancelled=true;
-							stop.store(true,std::memory_order_release);
+						cumulative=new_total;
+					}
+
+					if(need_segment_storage&&segment_id<segment_results.size()){
+						segment_results[segment_id].primes=std::move(primes);
+						segment_results[segment_id].ready.store(
+							true,std::memory_order_release);
+						segment_ready_cv.notify_all();
+					}
+
+					std::size_t completed=segments_processed.fetch_add(
+										  1,std::memory_order_acq_rel)+
+									  1;
+					if(opts.progress_callback&&!progress_cancelled){
+						std::lock_guard<std::mutex> lock(progress_mutex);
+						if(!progress_cancelled){
+							double progress_value=
+								(num_segments==0)
+									?1.0
+									:static_cast<double>(completed)/
+										 static_cast<double>(num_segments);
+							if(progress_value>1.0){
+								progress_value=1.0;
+							}
+							int progress_result=0;
+							try{
+								progress_result=opts.progress_callback(
+									progress_value,opts.progress_user_data);
+							}catch(...){
+								if(failure_kind==FailureKind::None){
+									failure_kind=FailureKind::Progress;
+									stored_exception=std::current_exception();
+								}
+								progress_cancelled=true;
+								stop.store(true,std::memory_order_release);
+								break;
+							}
+							if(progress_result!=0){
+								progress_cancelled=true;
+								stop.store(true,std::memory_order_release);
+							}
 						}
 					}
 				}

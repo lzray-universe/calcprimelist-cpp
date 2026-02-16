@@ -67,6 +67,10 @@ CpuInfo detect_windows_cpu_info(){
 	GetLogicalProcessorInformationEx(RelationProcessorCore,nullptr,&length);
 	std::vector<std::uint8_t> buffer(length);
 	std::map<LogicalProcessorKey,unsigned> logical_to_core;
+	std::map<LogicalProcessorKey,BYTE> logical_to_efficiency;
+	std::vector<std::pair<BYTE,unsigned>> core_efficiency;
+	BYTE performance_class=0;
+	bool has_performance_class=false;
 	if(GetLogicalProcessorInformationEx(
 		   RelationProcessorCore,
 		   reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
@@ -92,9 +96,13 @@ CpuInfo detect_windows_cpu_info(){
 						++core_logical;
 						LogicalProcessorKey key(affinity.Group,bit);
 						logical_to_core[key]=core_index;
+						logical_to_efficiency[key]=
+							ptr->Processor.EfficiencyClass;
 					}
 				}
 				logical+=core_logical;
+				core_efficiency.emplace_back(
+					ptr->Processor.EfficiencyClass,core_logical);
 				if(core_logical>1){
 					has_smt=true;
 				}
@@ -109,6 +117,33 @@ CpuInfo detect_windows_cpu_info(){
 			info.logical_cpus=logical;
 		}
 		info.has_smt=has_smt;
+		if(!core_efficiency.empty()){
+			BYTE min_efficiency=core_efficiency.front().first;
+			BYTE max_efficiency=core_efficiency.front().first;
+			unsigned performance_logical=0;
+			for(const auto&entry : core_efficiency){
+				min_efficiency=std::min(min_efficiency,entry.first);
+				max_efficiency=std::max(max_efficiency,entry.first);
+			}
+			for(const auto&entry : core_efficiency){
+				if(entry.first==min_efficiency){
+					performance_logical+=entry.second;
+				}
+			}
+			performance_class=min_efficiency;
+			has_performance_class=true;
+			if(performance_logical==0){
+				performance_logical=info.logical_cpus;
+			}
+			if(performance_logical>info.logical_cpus){
+				performance_logical=info.logical_cpus;
+			}
+			info.performance_logical_cpus=performance_logical;
+			info.efficiency_logical_cpus=
+				info.logical_cpus-performance_logical;
+			info.has_hybrid=(max_efficiency>min_efficiency)&&
+							(info.efficiency_logical_cpus>0);
+		}
 	}
 
 	length=0;
@@ -118,6 +153,14 @@ CpuInfo detect_windows_cpu_info(){
 	std::size_t min_l2=std::numeric_limits<std::size_t>::max();
 	bool have_l1=false;
 	bool have_l2=false;
+	std::size_t perf_min_l1=std::numeric_limits<std::size_t>::max();
+	std::size_t perf_min_l2=std::numeric_limits<std::size_t>::max();
+	std::size_t eff_min_l1=std::numeric_limits<std::size_t>::max();
+	std::size_t eff_min_l2=std::numeric_limits<std::size_t>::max();
+	bool have_perf_l1=false;
+	bool have_perf_l2=false;
+	bool have_eff_l1=false;
+	bool have_eff_l2=false;
 	std::set<std::string> seen_caches;
 	if(GetLogicalProcessorInformationEx(
 		   RelationCache,
@@ -142,13 +185,60 @@ CpuInfo detect_windows_cpu_info(){
 				if(per_core==0){
 					per_core=static_cast<std::size_t>(cache.CacheSize);
 				}
+				BYTE cache_class=0;
+				bool cache_class_valid=false;
+				bool cache_class_mixed=false;
+				const GROUP_AFFINITY*group_masks=
+					reinterpret_cast<const GROUP_AFFINITY*>(&cache.GroupMask);
+				for(WORD group_index=0;group_index<cache.GroupCount;
+					++group_index){
+					const GROUP_AFFINITY&affinity=group_masks[group_index];
+					KAFFINITY mask=affinity.Mask;
+					for(DWORD bit=0;bit<sizeof(KAFFINITY)*CHAR_BIT;++bit){
+						if((mask&(static_cast<KAFFINITY>(1)<<bit))==0){
+							continue;
+						}
+						LogicalProcessorKey key(affinity.Group,bit);
+						auto eff_it=logical_to_efficiency.find(key);
+						if(eff_it==logical_to_efficiency.end()){
+							continue;
+						}
+						if(!cache_class_valid){
+							cache_class=eff_it->second;
+							cache_class_valid=true;
+						}else if(cache_class!=eff_it->second){
+							cache_class_mixed=true;
+						}
+					}
+				}
+				if(cache_class_mixed){
+					cache_class_valid=false;
+				}
 				if(cache.Level==1&&cache.Type==CacheData){
 					min_l1=std::min(min_l1,per_core);
 					have_l1=true;
+					if(has_performance_class&&cache_class_valid){
+						if(cache_class==performance_class){
+							perf_min_l1=std::min(perf_min_l1,per_core);
+							have_perf_l1=true;
+						}else{
+							eff_min_l1=std::min(eff_min_l1,per_core);
+							have_eff_l1=true;
+						}
+					}
 				}else if(cache.Level==2&&
 						 (cache.Type==CacheUnified||cache.Type==CacheData)){
 					min_l2=std::min(min_l2,per_core);
 					have_l2=true;
+					if(has_performance_class&&cache_class_valid){
+						if(cache_class==performance_class){
+							perf_min_l2=std::min(perf_min_l2,per_core);
+							have_perf_l2=true;
+						}else{
+							eff_min_l2=std::min(eff_min_l2,per_core);
+							have_eff_l2=true;
+						}
+					}
 					std::ostringstream oss;
 					oss<<cache.Level<<':'<<static_cast<int>(cache.Type);
 					for(WORD group_index=0;group_index<cache.GroupCount;
@@ -191,12 +281,52 @@ CpuInfo detect_windows_cpu_info(){
 			}
 		}
 	}
+	if(have_perf_l1){
+		info.performance_l1_data_bytes=perf_min_l1;
+	}
+	if(have_perf_l2){
+		info.performance_l2_bytes=perf_min_l2;
+	}
+	if(have_eff_l1){
+		info.efficiency_l1_data_bytes=eff_min_l1;
+	}
+	if(have_eff_l2){
+		info.efficiency_l2_bytes=eff_min_l2;
+	}
 
 	if(!info.logical_cpus){
 		info.logical_cpus=std::max(1u,std::thread::hardware_concurrency());
 	}
 	if(!info.physical_cpus){
 		info.physical_cpus=std::max(1u,info.logical_cpus/2);
+	}
+	if(info.performance_logical_cpus==0||
+	   info.performance_logical_cpus>info.logical_cpus||
+	   (!info.has_hybrid&&info.efficiency_logical_cpus==0)){
+		info.performance_logical_cpus=info.logical_cpus;
+	}
+	info.efficiency_logical_cpus=
+		info.logical_cpus-info.performance_logical_cpus;
+	if(info.efficiency_logical_cpus==0){
+		info.has_hybrid=false;
+	}
+	if(!info.performance_l1_data_bytes){
+		info.performance_l1_data_bytes=info.l1_data_bytes;
+	}
+	if(!info.efficiency_l1_data_bytes){
+		info.efficiency_l1_data_bytes=info.l1_data_bytes;
+	}
+	if(!info.performance_l2_bytes){
+		info.performance_l2_bytes=info.l2_bytes;
+	}
+	if(!info.efficiency_l2_bytes){
+		info.efficiency_l2_bytes=info.l2_bytes;
+	}
+	if(!info.has_hybrid){
+		info.performance_l1_data_bytes=info.l1_data_bytes;
+		info.performance_l2_bytes=info.l2_bytes;
+		info.efficiency_l1_data_bytes=info.l1_data_bytes;
+		info.efficiency_l2_bytes=info.l2_bytes;
 	}
 	if(info.physical_cpus==info.logical_cpus){
 		info.has_smt=false;
@@ -219,6 +349,37 @@ unsigned count_affinity_cpus(){
 		}
 	}
 	return count;
+}
+
+bool read_u64_file(const std::string&path,std::uint64_t&out_value){
+	std::ifstream file(path);
+	if(!file){
+		return false;
+	}
+	std::uint64_t value=0;
+	file>>value;
+	if(!file){
+		return false;
+	}
+	out_value=value;
+	return true;
+}
+
+std::uint64_t read_cpu_capacity_hint(const std::string&base_path,
+									 unsigned cpu_id){
+	std::string cpu_dir=base_path+"/cpu"+std::to_string(cpu_id);
+	std::uint64_t value=0;
+	if(read_u64_file(cpu_dir+"/cpu_capacity",value)&&value>0){
+		return value;
+	}
+	// cpufreq fallback for systems where cpu_capacity is unavailable.
+	if(read_u64_file(cpu_dir+"/cpufreq/cpuinfo_max_freq",value)&&value>0){
+		return value;
+	}
+	if(read_u64_file(cpu_dir+"/cpufreq/scaling_max_freq",value)&&value>0){
+		return value;
+	}
+	return 0;
 }
 
 struct LinuxCpuTopologyEntry{
@@ -388,7 +549,7 @@ struct CacheIdentifier{
 CpuInfo detect_linux_cpu_info(){
 	CpuInfo info;
 	unsigned affinity=count_affinity_cpus();
-	unsigned logical=std::max(affinity,std::thread::hardware_concurrency());
+	unsigned logical=affinity?affinity:std::thread::hardware_concurrency();
 	if(logical==0){
 		logical=1;
 	}
@@ -411,11 +572,61 @@ CpuInfo detect_linux_cpu_info(){
 	info.physical_cpus=physical;
 	info.has_smt=physical<logical;
 
+	std::map<unsigned,std::uint64_t> cpu_capacity_hints;
+	std::uint64_t min_capacity=std::numeric_limits<std::uint64_t>::max();
+	std::uint64_t max_capacity=0;
+	for(const auto&entry : topology){
+		std::uint64_t hint=
+			read_cpu_capacity_hint(topology_base,entry.first);
+		if(hint==0){
+			continue;
+		}
+		cpu_capacity_hints.emplace(entry.first,hint);
+		min_capacity=std::min(min_capacity,hint);
+		max_capacity=std::max(max_capacity,hint);
+	}
+	info.performance_logical_cpus=info.logical_cpus;
+	info.efficiency_logical_cpus=0;
+	info.has_hybrid=false;
+	std::set<unsigned> performance_cpus;
+	std::set<unsigned> efficiency_cpus;
+	if(!cpu_capacity_hints.empty()&&max_capacity>0&&min_capacity<max_capacity){
+		const std::uint64_t performance_threshold=
+			(max_capacity*95ULL+99ULL)/100ULL;
+		unsigned performance_count=0;
+		for(const auto&entry : topology){
+			auto it=cpu_capacity_hints.find(entry.first);
+			if(it==cpu_capacity_hints.end()){
+				continue;
+			}
+			if(it->second>=performance_threshold){
+				++performance_count;
+				performance_cpus.insert(entry.first);
+			}else{
+				efficiency_cpus.insert(entry.first);
+			}
+		}
+		if(performance_count>0&&performance_count<info.logical_cpus){
+			info.performance_logical_cpus=performance_count;
+			info.efficiency_logical_cpus=
+				info.logical_cpus-performance_count;
+			info.has_hybrid=true;
+		}
+	}
+
 	std::set<CacheIdentifier> seen;
 	std::size_t min_l1=std::numeric_limits<std::size_t>::max();
 	std::size_t min_l2=std::numeric_limits<std::size_t>::max();
 	bool have_l1=false;
 	bool have_l2=false;
+	std::size_t perf_min_l1=std::numeric_limits<std::size_t>::max();
+	std::size_t perf_min_l2=std::numeric_limits<std::size_t>::max();
+	std::size_t eff_min_l1=std::numeric_limits<std::size_t>::max();
+	std::size_t eff_min_l2=std::numeric_limits<std::size_t>::max();
+	bool have_perf_l1=false;
+	bool have_perf_l2=false;
+	bool have_eff_l1=false;
+	bool have_eff_l2=false;
 
 	for(const auto&entry : topology){
 		unsigned cpu_id=entry.first;
@@ -497,9 +708,47 @@ CpuInfo detect_linux_cpu_info(){
 			if(level==1&&type_lower=="data"){
 				min_l1=std::min(min_l1,per_core);
 				have_l1=true;
+				bool all_perf=!shared_cpus.empty();
+				bool all_eff=!shared_cpus.empty();
+				for(unsigned shared_cpu : shared_cpus){
+					if(performance_cpus.find(shared_cpu)==
+					   performance_cpus.end()){
+						all_perf=false;
+					}
+					if(efficiency_cpus.find(shared_cpu)==
+					   efficiency_cpus.end()){
+						all_eff=false;
+					}
+				}
+				if(all_perf){
+					perf_min_l1=std::min(perf_min_l1,per_core);
+					have_perf_l1=true;
+				}else if(all_eff){
+					eff_min_l1=std::min(eff_min_l1,per_core);
+					have_eff_l1=true;
+				}
 			}else if(level==2&&(type_lower=="unified"||type_lower=="data")){
 				min_l2=std::min(min_l2,per_core);
 				have_l2=true;
+				bool all_perf=!shared_cpus.empty();
+				bool all_eff=!shared_cpus.empty();
+				for(unsigned shared_cpu : shared_cpus){
+					if(performance_cpus.find(shared_cpu)==
+					   performance_cpus.end()){
+						all_perf=false;
+					}
+					if(efficiency_cpus.find(shared_cpu)==
+					   efficiency_cpus.end()){
+						all_eff=false;
+					}
+				}
+				if(all_perf){
+					perf_min_l2=std::min(perf_min_l2,per_core);
+					have_perf_l2=true;
+				}else if(all_eff){
+					eff_min_l2=std::min(eff_min_l2,per_core);
+					have_eff_l2=true;
+				}
 				info.l2_total_bytes+=size_bytes;
 			}
 		}
@@ -526,6 +775,36 @@ CpuInfo detect_linux_cpu_info(){
 			}
 		}
 	}
+	if(have_perf_l1){
+		info.performance_l1_data_bytes=perf_min_l1;
+	}
+	if(have_perf_l2){
+		info.performance_l2_bytes=perf_min_l2;
+	}
+	if(have_eff_l1){
+		info.efficiency_l1_data_bytes=eff_min_l1;
+	}
+	if(have_eff_l2){
+		info.efficiency_l2_bytes=eff_min_l2;
+	}
+	if(!info.performance_l1_data_bytes){
+		info.performance_l1_data_bytes=info.l1_data_bytes;
+	}
+	if(!info.efficiency_l1_data_bytes){
+		info.efficiency_l1_data_bytes=info.l1_data_bytes;
+	}
+	if(!info.performance_l2_bytes){
+		info.performance_l2_bytes=info.l2_bytes;
+	}
+	if(!info.efficiency_l2_bytes){
+		info.efficiency_l2_bytes=info.l2_bytes;
+	}
+	if(!info.has_hybrid){
+		info.performance_l1_data_bytes=info.l1_data_bytes;
+		info.performance_l2_bytes=info.l2_bytes;
+		info.efficiency_l1_data_bytes=info.l1_data_bytes;
+		info.efficiency_l2_bytes=info.l2_bytes;
+	}
 	return info;
 }
 
@@ -550,6 +829,124 @@ unsigned effective_thread_count(const CpuInfo&info){
 		threads=1;
 	}
 	return threads;
+}
+
+unsigned choose_thread_count(const CpuInfo&info,unsigned requested_threads,
+							 std::uint64_t range_span,
+							 CoreSchedulingMode mode){
+	(void)range_span;
+	if(requested_threads!=0){
+		return requested_threads;
+	}
+
+	unsigned logical=info.logical_cpus?info.logical_cpus:1;
+	unsigned performance=
+		info.performance_logical_cpus?info.performance_logical_cpus:logical;
+	if(performance>logical){
+		performance=logical;
+	}
+
+	switch(mode){
+	case CoreSchedulingMode::BigOnly:
+		return std::max(1u,performance);
+	case CoreSchedulingMode::AllCores:
+		return std::max(1u,logical);
+	case CoreSchedulingMode::Legacy:
+	case CoreSchedulingMode::Auto:
+	default:
+		return std::max(1u,effective_thread_count(info));
+	}
+}
+
+bool is_performance_worker(const CpuInfo&info,unsigned worker_index,
+						   unsigned thread_count,CoreSchedulingMode mode){
+	(void)mode;
+	if(thread_count==0){
+		return true;
+	}
+	unsigned logical=info.logical_cpus?info.logical_cpus:thread_count;
+	unsigned performance=
+		info.performance_logical_cpus?info.performance_logical_cpus:logical;
+	if(performance>logical){
+		performance=logical;
+	}
+	const bool hybrid=info.has_hybrid&&performance<logical&&
+					  info.efficiency_logical_cpus>0;
+	if(!hybrid){
+		return true;
+	}
+	unsigned performance_workers=std::min(thread_count,performance);
+	return worker_index<performance_workers;
+}
+
+std::uint32_t choose_worker_segment_batch(const CpuInfo&info,
+										  unsigned worker_index,
+										  unsigned thread_count,
+										  std::uint64_t range_span,
+										  CoreSchedulingMode mode){
+	if(thread_count<=1){
+		return 1;
+	}
+	if(mode==CoreSchedulingMode::Legacy){
+		return 1;
+	}
+
+	unsigned logical=info.logical_cpus?info.logical_cpus:thread_count;
+	unsigned performance=
+		info.performance_logical_cpus?info.performance_logical_cpus:logical;
+	if(performance>logical){
+		performance=logical;
+	}
+	const bool hybrid=info.has_hybrid&&performance<logical&&
+					  info.efficiency_logical_cpus>0;
+	if(!hybrid||mode==CoreSchedulingMode::BigOnly){
+		return 1;
+	}
+
+	if(!is_performance_worker(info,worker_index,thread_count,mode)){
+		return 1;
+	}
+
+	std::size_t performance_l2=
+		info.performance_l2_bytes?info.performance_l2_bytes:info.l2_bytes;
+	std::size_t efficiency_l2=
+		info.efficiency_l2_bytes?info.efficiency_l2_bytes:info.l2_bytes;
+	if(performance_l2==0){
+		performance_l2=1024*1024;
+	}
+	if(efficiency_l2==0){
+		efficiency_l2=performance_l2;
+	}
+	std::size_t l2_ratio=performance_l2/efficiency_l2;
+
+	std::uint32_t batch=2;
+	if(l2_ratio>=4){
+		batch=5;
+	}else if(l2_ratio>=3){
+		batch=4;
+	}else if(l2_ratio>=2){
+		batch=3;
+	}
+
+	constexpr std::uint64_t kHybridLargeSpan=8000000000ULL;
+	constexpr std::uint64_t kHybridMediumSpan=1000000000ULL;
+	if(range_span>=kHybridLargeSpan){
+		if(mode==CoreSchedulingMode::AllCores&&batch<8){
+			++batch;
+		}else if(mode==CoreSchedulingMode::Auto&&batch<6){
+			++batch;
+		}
+	}else if(range_span<kHybridMediumSpan){
+		batch=std::min<std::uint32_t>(batch,2);
+	}
+
+	if(batch<1){
+		batch=1;
+	}
+	if(batch>8){
+		batch=8;
+	}
+	return batch;
 }
 
 } // namespace calcprime

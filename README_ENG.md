@@ -8,6 +8,7 @@ A parallelizable **segmented prime sieve** tool & library (C++20). It supports:
 * Wheel pre-sieving: `mod 30 / 210 / 1155`
 * Auto-tuned segment/tile sizes based on CPU cache & thread count
 * Three base output formats (`text` / `binary` / `delta16`) with optional Zstd compression
+* Optional grouped export: split output by range groups / primes per group / natural-number span, with TSV index
 * Meissel–Lehmer prime counting
 * Miller–Rabin primality testing
 * C++ static library and a cross-language C ABI (DLL/.so)
@@ -108,14 +109,22 @@ calcprimelist --from A --to B [options]
 
   Performance / correctness:
   --threads N         Number of threads (default 0 = auto, based on CPU)
+  --core-schedule M   Core policy: auto|big|all|legacy (default auto)
+  --big-cores         Alias of --core-schedule big (prefer performance cores)
+  --all-cores         Alias of --core-schedule all (throughput mode)
   --wheel 30|210|1155 Wheel selection (default 30)
   --segment BYTES     Override segment size (default: cache-aware)
   --tile BYTES        Override tile size (default: cache-aware)
 
   Output & stats:
   --out PATH          Write output to file (default stdout)
+  --out-index PATH    Write grouped-export index TSV path (with grouping options)
+  --out-groups N      Split export into N range groups (requires --print --out)
+  --out-group-primes X  Split export by X primes per group (requires --print --out)
+  --out-group-range Y  Split export by Y natural numbers per group (requires --print --out)
   --out-format FMT    text (default) | binary | delta16
   --zstd              Apply zstd compression to output bytes (if supported)
+  --progress          Show segment progress and ETA on stderr
   --time              Print elapsed time (microseconds)
   --stats             Print configuration stats (threads, cache, segments, etc.)
 
@@ -144,11 +153,17 @@ calcprimelist --from A --to B [options]
 # 4) Stronger wheel and larger segment sizes (throughput-oriented)
 ./calcprimelist --to 1e9 --count --wheel 210 --segment 8M --tile 256K --time
 
+# 4b) wheel=210 bitmap counting path (compare on large ranges)
+./calcprimelist --to 1e10 --count --wheel 210 --wheel-bitmap --time
+
 # 5) One-command benchmark (auto-detect host info + Markdown table)
 ./calcprimelist --stest
 
 # 6) Single-value primality test (without --to)
 ./calcprimelist --test 1000000007
+
+# 7) Grouped export: split into 16 range groups + write index TSV
+./calcprimelist --from 1 --to 1e8 --print --out primes.bin --out-format binary --out-groups 16 --out-index primes.index.tsv
 ```
 
 ---
@@ -186,6 +201,15 @@ calcprimelist --from A --to B [options]
 * `--zstd` is no longer an output format. It compresses the byte stream produced by `text`, `binary`, or `delta16` into a standard zstd frame.
 * If the current build has no zstd support, `--zstd` fails with `zstd not supported in this build`.
 * Compatibility aliases: `--out-format zstd` and `--out-format zstd+delta` map to `--out-format delta16 --zstd` (deprecated).
+
+### Grouped export
+
+* Three mutually-exclusive modes: `--out-groups N` / `--out-group-primes X` / `--out-group-range Y`.
+* Grouped export requires `--print` and `--out PATH`; `--out-index` is valid only when grouping is enabled.
+* Group files are derived from `--out` (example: `primes.bin` -> `primes.g0001.bin`, `primes.g0002.bin`, ...).
+* Default index path is `--out + ".index.tsv"`; override with `--out-index PATH`.
+* Index columns (TSV): `group_id`, `file_path`, `group_from`, `group_to`, `prime_count`, `first_prime`, `last_prime`.
+
 
 ---
 
@@ -567,8 +591,12 @@ Relevant code: `prime_count.*`
 
 * **Threads**: `--threads 0` (default) auto-selects based on physical/logical cores and SMT; you can also use `calcprime_detect_cpu_info` / `calcprime_effective_thread_count` to obtain recommended values in your app.
 * **Wheel**: `--wheel 210` is often faster for large ranges; `1155` pre-sieves the most but has bigger masks/step tables and may not pay off for small ranges.
+* **wheel210 bitmap path**: `--wheel 210 --wheel-bitmap` includes AVX2 dense-merge and boundary-mask counting optimizations (AVX2 enabled in default builds); for `1e9+` ranges, benchmark A/B on your target machine before choosing.
 * **Segments/tiles**: if you know the target cache hierarchy, set `--segment / --tile` manually; as a rule of thumb, **tile ≤ L1D, segment ≈ L2** performs well.
 * **Finding the K-th prime**: if memory is tight or you want predictable peaks, consider `--threads 1`. In parallel mode, the tool advances by segment counts and can still find it, with extra synchronization and potential re-scans for some segments.
 * **Output throughput**: for bulk export, prefer `--out-format binary`, or `--out-format delta16 --zstd`. Text is human-friendly but less storage/bandwidth efficient.
+* **Grouped export**: `--out-groups` / `--out-group-primes` / `--out-group-range` are mutually exclusive and only work with `--print --out`.
+* **Progress display**: `--progress` works on the segmented path; in `--ml` or `--wheel-bitmap` mode it is not available and prints a warning.
 * **Bounds**: all computations use `uint64_t`. Ensure `0 ≤ from < to` and the upper bound doesn’t overflow. Only odd numbers are marked; `2` is handled separately in a prefix step.
 * **Tests**: `ctest` includes examples (e.g., `--to 100000 --count --time`).
+

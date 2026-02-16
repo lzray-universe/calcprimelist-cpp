@@ -16,6 +16,7 @@ English README: [![English](https://img.shields.io/badge/lang-English-informatio
 * 轮因子（wheel）预筛：`mod 30 / 210 / 1155`
 * 自动依据 CPU 缓存与线程数选取分段/分块尺寸
 * 三种基础输出（`text` / `binary` / `delta16`）与可选 Zstd 压缩
+* 可选分组导出：按区间组数 / 每组素数数 / 每组自然数跨度切分，并生成 TSV 索引
 * Meissel–Lehmer 质数计数
 * Miller–Rabin 素性测试
 * C++ 静态库、跨语言 C ABI（DLL/.so）调用
@@ -118,14 +119,22 @@ calcprimelist --from A --to B [options]
 
   性能/正确性相关：
   --threads N         指定线程数（缺省 0=自动，取决于 CPU）
+  --core-schedule M   核心调度：auto|big|all|legacy（默认 auto）
+  --big-cores         等价于 --core-schedule big（偏向大核）
+  --all-cores         等价于 --core-schedule all（全核心吞吐）
   --wheel 30|210|1155 轮因子选择（默认 30）
   --segment BYTES     覆盖分段大小（默认依据缓存自适应）
   --tile BYTES        覆盖分块大小（默认依据缓存自适应）
 
   输出与统计：
   --out PATH          将输出写入文件（默认 stdout）
+  --out-index PATH    分组导出的索引 TSV 路径（需搭配分组选项）
+  --out-groups N      按区间等分为 N 组导出（需 --print --out）
+  --out-group-primes X  按每组 X 个素数导出（需 --print --out）
+  --out-group-range Y  按每组 Y 个自然数跨度导出（需 --print --out）
   --out-format FMT    text（默认）| binary | delta16
   --zstd              对输出字节流做 zstd 压缩（若构建支持）
+  --progress          在 stderr 打印分段进度与 ETA
   --time              打印耗时（微秒）
   --stats             打印配置统计（线程、缓存、分段等）
 
@@ -154,11 +163,17 @@ calcprimelist --from A --to B [options]
 # 4) 指定更强的轮因子与更大分段（高吞吐场景）
 ./calcprimelist --to 1e9 --count --wheel 210 --segment 8M --tile 256K --time
 
+# 4b) wheel=210 的 bitmap 计数路径（大区间可对比）
+./calcprimelist --to 1e10 --count --wheel 210 --wheel-bitmap --time
+
 # 5) 一键性能基准（自动识别主机信息并输出 Markdown 表）
 ./calcprimelist --stest
 
 # 6) 单点素性测试（无需 --to）
 ./calcprimelist --test 1000000007
+
+# 7) 分组导出：按区间等分 16 组，并写出索引 TSV
+./calcprimelist --from 1 --to 1e8 --print --out primes.bin --out-format binary --out-groups 16 --out-index primes.index.tsv
 ```
 
 ---
@@ -196,6 +211,15 @@ calcprimelist --from A --to B [options]
 * `--zstd` 不再是输出格式，而是对上述 `text` / `binary` / `delta16` 任一格式的字节流进行 zstd frame 流式压缩。
 * 若当前构建不支持 zstd，传入 `--zstd` 会报错：`zstd not supported in this build`。
 * 兼容别名：`--out-format zstd` 或 `--out-format zstd+delta` 等价于 `--out-format delta16 --zstd`（已弃用）。
+
+### 分组导出（Grouped Export）
+
+* 三种互斥模式：`--out-groups N` / `--out-group-primes X` / `--out-group-range Y`。
+* 仅在 `--print` 且提供 `--out PATH` 时可用；`--out-index` 仅在启用分组时可用。
+* 组文件名基于 `--out` 自动派生（例如：`primes.bin` -> `primes.g0001.bin`、`primes.g0002.bin`...）。
+* 默认索引文件为 `--out + ".index.tsv"`，也可用 `--out-index PATH` 覆盖。
+* 索引列（TSV）：`group_id`、`file_path`、`group_from`、`group_to`、`prime_count`、`first_prime`、`last_prime`。
+
 
 ---
 
@@ -578,8 +602,12 @@ int main() {
 
 * **线程数**：`--threads 0`（默认）将依据物理/逻辑核与 SMT 自动选择；也可用 `calcprime_detect_cpu_info` / `calcprime_effective_thread_count` 在应用层拿到推荐值。
 * **轮因子**：`--wheel 210` 在大区间往往更快；`1155` 预筛最强，但掩码/步进表更大，小区间未必划算。
+* **wheel210 bitmap 路径**：`--wheel 210 --wheel-bitmap` 已加入 AVX2 dense 合并与边界段掩码统计优化（默认构建开启 AVX2）；建议在目标机器对 `1e9+` 区间做 A/B 实测后选择。
 * **分段/分块**：若清楚目标平台缓存，可手动设定 `--segment / --tile`；一般保证 **tile ≤ L1D，segment 近似 L2** 会有较好效果。
 * **寻找第 K 个素数**：若内存紧/更稳定，可用 `--threads 1`；并行情况下内部会以段计数推进，也能找到，但需要额外同步与（可能）二次扫描某些段。
 * **输出吞吐**：批量写文件时，优先 `--out-format binary`，或 `--out-format delta16 --zstd`。文本输出人类友好但对磁盘/带宽不友好。
+* **分组导出**：`--out-groups` / `--out-group-primes` / `--out-group-range` 三者互斥，且仅在 `--print --out` 下可用。
+* **进度显示**：`--progress` 仅在常规分段路径可用；`--ml` 与 `--wheel-bitmap` 模式下会提示不可用。
 * **边界**：所有计算在 `uint64_t` 范围内进行；请确保 `--from/--to` 满足 `0 ≤ from < to` 且上界不溢出。内部仅标记奇数，`2` 会在前缀处理中单独考虑。
 * **测试**：`ctest` 中含有示例（如 `--to 100000 --count --time`）。
+
