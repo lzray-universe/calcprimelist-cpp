@@ -169,15 +169,15 @@ jobs:
       - name: Smoke test
         run: |
           set -eux
-          ./build/ calcprimelist --help || true
+          ./build/calcprimelist --help || true
           ctest --test-dir build --output-on-failure || true
 
       - name: Collect artifacts
         run: |
           set -eux
           mkdir -p out/${{ matrix.label }}
-          [ -f build/ calcprimelist ] && cp build/ calcprimelist out/${{ matrix.label }}/ calcprimelist-${{ matrix.artifact_suffix }}
-          [ -f build/ calcprimelist-static ] && cp build/ calcprimelist-static out/${{ matrix.label }}/ calcprimelist-static-${{ matrix.artifact_suffix }} || true
+          [ -f build/calcprimelist ] && cp build/calcprimelist out/${{ matrix.label }}/calcprimelist-${{ matrix.artifact_suffix }}
+          [ -f build/calcprimelist-static ] && cp build/calcprimelist-static out/${{ matrix.label }}/calcprimelist-static-${{ matrix.artifact_suffix }} || true
           ls build | grep -E '^libcalcprime(-cli)?\.' >/dev/null 2>&1 && cp build/libcalcprime* out/${{ matrix.label }}/ || true
 
       - name: Upload artifacts
@@ -306,8 +306,8 @@ jobs:
         run: |
           set -eux
           mkdir -p out/arm64
-          [ -f build/ calcprimelist ] && cp build/ calcprimelist out/arm64/ || true
-          [ -f build/ calcprimelist-static ] && cp build/ calcprimelist-static out/arm64/ || true
+          [ -f build/calcprimelist ] && cp build/calcprimelist out/arm64/ || true
+          [ -f build/calcprimelist-static ] && cp build/calcprimelist-static out/arm64/ || true
           ls build | grep -E '^libcalcprime(-cli)?\.' >/dev/null 2>&1 && cp build/libcalcprime* out/arm64/ || true
 
       - name: Upload artifacts
@@ -366,8 +366,8 @@ jobs:
         run: |
           set -eux
           mkdir -p out/noavx
-          [ -f build/ calcprimelist ] && cp build/ calcprimelist out/noavx/ || true
-          [ -f build/ calcprimelist-static ] && cp build/ calcprimelist-static out/noavx/ || true
+          [ -f build/calcprimelist ] && cp build/calcprimelist out/noavx/ || true
+          [ -f build/calcprimelist-static ] && cp build/calcprimelist-static out/noavx/ || true
           ls build | grep -E '^libcalcprime(-cli)?\.' >/dev/null 2>&1 && cp build/libcalcprime* out/noavx/ || true
 
       - name: Upload artifacts
