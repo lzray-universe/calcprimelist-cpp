@@ -14,6 +14,8 @@ src/bucket.cpp
 src/cpu_info.cpp
 src/main.cpp
 src/marker.cpp
+src/parquet_format.cpp
+src/parquet_format.h
 src/popcnt.cpp
 src/prime_count.cpp
 src/segmenter.cpp

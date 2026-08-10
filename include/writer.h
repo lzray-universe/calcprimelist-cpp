@@ -16,6 +16,7 @@ enum class PrimeOutputFormat{
 	Text,
 	Binary,
 	Delta16,
+	Parquet,
 };
 
 class PrimeWriter{
@@ -35,6 +36,14 @@ class PrimeWriter{
 	struct Chunk{
 		std::string data;
 		bool flush=false;
+		std::uint64_t value_count=0;
+	};
+
+	struct ParquetRowGroup{
+		std::int64_t data_page_offset=0;
+		std::int64_t num_values=0;
+		std::int64_t total_uncompressed_size=0;
+		std::int64_t total_compressed_size=0;
 	};
 
 	void enqueue_chunk(Chunk&&chunk);
@@ -45,6 +54,8 @@ class PrimeWriter{
 	std::string encode_delta16(const std::vector<std::uint64_t>&primes);
 	std::string encode_delta16_value(std::uint64_t value);
 	void write_file_bytes(const char*data,std::size_t size);
+	void write_parquet_chunk(const Chunk&chunk);
+	void write_parquet_footer();
 #if defined(CALCPRIME_HAS_ZSTD)
 	void flush_zstd_stream(bool final_frame);
 #endif
@@ -70,6 +81,10 @@ class PrimeWriter{
 	std::uint64_t previous_prime_;
 	void*zstd_cctx_;
 	std::string zstd_out_buffer_;
+	std::uint64_t file_offset_;
+	std::uint64_t parquet_num_rows_;
+	std::vector<ParquetRowGroup> parquet_row_groups_;
+	bool parquet_footer_written_;
 
 	mutable std::mutex error_mutex_;
 	std::atomic<bool> io_error_;

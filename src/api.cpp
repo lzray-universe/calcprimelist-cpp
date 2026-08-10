@@ -39,6 +39,7 @@ bool is_valid_output_format(calcprime_output_format format){
 	case CALCPRIME_OUTPUT_TEXT:
 	case CALCPRIME_OUTPUT_BINARY:
 	case CALCPRIME_OUTPUT_DELTA16:
+	case CALCPRIME_OUTPUT_PARQUET:
 		return true;
 	}
 	return false;
@@ -64,6 +65,8 @@ calcprime::PrimeOutputFormat to_cpp_output(calcprime_output_format format){
 		return calcprime::PrimeOutputFormat::Binary;
 	case CALCPRIME_OUTPUT_DELTA16:
 		return calcprime::PrimeOutputFormat::Delta16;
+	case CALCPRIME_OUTPUT_PARQUET:
+		return calcprime::PrimeOutputFormat::Parquet;
 	}
 	return calcprime::PrimeOutputFormat::Text;
 }
@@ -88,6 +91,8 @@ calcprime_output_format to_c_output(calcprime::PrimeOutputFormat format){
 		return CALCPRIME_OUTPUT_BINARY;
 	case calcprime::PrimeOutputFormat::Delta16:
 		return CALCPRIME_OUTPUT_DELTA16;
+	case calcprime::PrimeOutputFormat::Parquet:
+		return CALCPRIME_OUTPUT_PARQUET;
 	}
 	return CALCPRIME_OUTPUT_TEXT;
 }

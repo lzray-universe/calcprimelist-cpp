@@ -7,7 +7,7 @@ A parallelizable **segmented prime sieve** tool & library (C++20). It supports:
 * Interval counting `π(B) − π(A)`, printing primes in a range, and the *K*-th prime within a range
 * Wheel pre-sieving: `mod 30 / 210 / 1155`
 * Auto-tuned segment/tile sizes based on CPU cache & thread count
-* Three base output formats (`text` / `binary` / `delta16`) with optional Zstd compression
+* Four output formats (`text` / `binary` / `delta16` / `parquet`) with optional Zstd compression
 * Optional grouped export: split output by range groups / primes per group / natural-number span, with TSV index
 * Meissel–Lehmer prime counting
 * Miller–Rabin primality testing
@@ -91,6 +91,9 @@ Build targets:
 
 # Save to file (delta16 + Zstd; space/bandwidth friendly)
 ./build/calcprimelist --to 10000000 --print --out primes.zst --out-format delta16 --zstd
+
+# Save as Parquet for direct preview in the Hugging Face Dataset Viewer
+./build/calcprimelist --to 10000000 --print --out train.parquet --out-format parquet --zstd
 ```
 
 > Scientific notation, hexadecimal values, and size suffixes are supported: `--to 1e8`, `--to 0x1e5`, `--segment 1M`, `--tile 256K`, etc.
@@ -122,8 +125,8 @@ calcprimelist --from A --to B [options]
   --out-groups N      Split export into N range groups (requires --print --out)
   --out-group-primes X  Split export by X primes per group (requires --print --out)
   --out-group-range Y  Split export by Y natural numbers per group (requires --print --out)
-  --out-format FMT    text (default) | binary | delta16
-  --zstd              Apply zstd compression to output bytes (if supported)
+  --out-format FMT    text (default) | binary | delta16 | parquet
+  --zstd              Use zstd (Parquet pages or whole output stream)
   --progress          Show segment progress and ETA on stderr
   --time              Print elapsed time (microseconds)
   --stats             Print configuration stats (threads, cache, segments, etc.)
@@ -196,9 +199,30 @@ calcprimelist --from A --to B [options]
 * From the second prime onward, each value is written as delta-to-previous using `int16_t` little-endian (positive).
 * If a delta exceeds `INT16_MAX`, the writer throws an error directly (no escape/varint scheme).
 
+### `parquet`
+
+* A standard Parquet file with one required `uint64` column named `prime`; directly readable by PyArrow, Pandas, Polars, DuckDB, and the Hugging Face Dataset Viewer.
+* Uses PLAIN data encoding and writes row groups incrementally without an Arrow or Thrift runtime dependency.
+* Use the `.parquet` extension. After uploading it to a Hugging Face dataset repository, the file can be previewed online:
+
+  ```bash
+  calcprimelist --to 1e8 --print --out train.parquet --out-format parquet --zstd
+  hf upload USER/DATASET train.parquet data/train-00000-of-00001.parquet --repo-type=dataset
+  ```
+
+* Local read example:
+
+  ```python
+  import pyarrow.parquet as pq
+  table = pq.read_table("train.parquet")
+  print(table.schema)       # prime: uint64 not null
+  print(table["prime"][:5])
+  ```
+
 ### `--zstd` (optional compression switch)
 
-* `--zstd` is no longer an output format. It compresses the byte stream produced by `text`, `binary`, or `delta16` into a standard zstd frame.
+* For `text`, `binary`, and `delta16`, `--zstd` compresses the complete output byte stream into a standard zstd frame.
+* For `parquet`, `--zstd` selects Parquet's internal ZSTD page codec. The result remains a directly readable `.parquet` file and is not wrapped in an outer zstd frame.
 * If the current build has no zstd support, `--zstd` fails with `zstd not supported in this build`.
 * Compatibility aliases: `--out-format zstd` and `--out-format zstd+delta` map to `--out-format delta16 --zstd` (deprecated).
 
@@ -306,7 +330,8 @@ typedef enum calcprime_output_format {
     CALCPRIME_OUTPUT_TEXT        = 0,
     CALCPRIME_OUTPUT_BINARY      = 1,
     CALCPRIME_OUTPUT_DELTA16     = 2,
-    CALCPRIME_OUTPUT_ZSTD_DELTA  = CALCPRIME_OUTPUT_DELTA16 // deprecated alias
+    CALCPRIME_OUTPUT_ZSTD_DELTA  = CALCPRIME_OUTPUT_DELTA16, // deprecated alias
+    CALCPRIME_OUTPUT_PARQUET     = 3
 } calcprime_output_format;
 
 struct calcprime_cancel_token;
@@ -340,7 +365,7 @@ typedef struct calcprime_range_options {
     calcprime_progress_callback     progress_callback;    // optional: progress callback
     void*       progress_user_data;
     calcprime_cancel_token*        cancel_token;         // optional: cancellable
-    int         compress_zstd;      // 1 = enable zstd compression (if supported)
+    int         compress_zstd;      // 1 = enable zstd; Parquet uses page compression
 } calcprime_range_options;
 ```
 
@@ -539,7 +564,7 @@ Relevant code: `segmenter.*` / `cpu_info.*`
 ### 5. Counting & output
 
 * **Counting**: after the bitset is ready, call `count_zero_bits(bits, bit_count)`, with AVX2/AVX-512 `popcnt` variants when available.
-* **Output**: `PrimeWriter` uses an I/O thread with a **chunk queue**; producers enqueue bytes encoded as `text`/`binary`/`delta16`, and the writer thread performs optional zstd streaming compression before writing to file/stdout.
+* **Output**: `PrimeWriter` uses an I/O thread with a **chunk queue**; producers enqueue `text`/`binary`/`delta16`/`parquet` blocks, and the writer thread performs zstd streaming compression or Parquet page writes before writing to file/stdout.
 
 Relevant code: `popcnt.*` / `writer.*`
 
@@ -594,7 +619,7 @@ Relevant code: `prime_count.*`
 * **wheel210 bitmap path**: `--wheel 210 --wheel-bitmap` includes AVX2 dense-merge and boundary-mask counting optimizations (AVX2 enabled in default builds); for `1e9+` ranges, benchmark A/B on your target machine before choosing.
 * **Segments/tiles**: if you know the target cache hierarchy, set `--segment / --tile` manually; as a rule of thumb, **tile ≤ L1D, segment ≈ L2** performs well.
 * **Finding the K-th prime**: if memory is tight or you want predictable peaks, consider `--threads 1`. In parallel mode, the tool advances by segment counts and can still find it, with extra synchronization and potential re-scans for some segments.
-* **Output throughput**: for bulk export, prefer `--out-format binary`, or `--out-format delta16 --zstd`. Text is human-friendly but less storage/bandwidth efficient.
+* **Output throughput**: for bulk export, prefer `--out-format binary`, `--out-format delta16 --zstd`, or `--out-format parquet --zstd` when analytics/Hugging Face preview is needed. Text is human-friendly but less storage/bandwidth efficient.
 * **Grouped export**: `--out-groups` / `--out-group-primes` / `--out-group-range` are mutually exclusive and only work with `--print --out`.
 * **Progress display**: `--progress` works on the segmented path; in `--ml` or `--wheel-bitmap` mode it is not available and prints a warning.
 * **Bounds**: all computations use `uint64_t`. Ensure `0 ≤ from < to` and the upper bound doesn’t overflow. Only odd numbers are marked; `2` is handled separately in a prefix step.

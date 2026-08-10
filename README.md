@@ -15,7 +15,7 @@ English README: [![English](https://img.shields.io/badge/lang-English-informatio
 * 区间计数 `π(B)−π(A)`、区间打印、区间内第 *K* 个素数
 * 轮因子（wheel）预筛：`mod 30 / 210 / 1155`
 * 自动依据 CPU 缓存与线程数选取分段/分块尺寸
-* 三种基础输出（`text` / `binary` / `delta16`）与可选 Zstd 压缩
+* 四种输出（`text` / `binary` / `delta16` / `parquet`）与可选 Zstd 压缩
 * 可选分组导出：按区间组数 / 每组素数数 / 每组自然数跨度切分，并生成 TSV 索引
 * Meissel–Lehmer 质数计数
 * Miller–Rabin 素性测试
@@ -101,6 +101,9 @@ cmake --build build --config Release
 
 # 保存到文件（delta16 + Zstd；更省空间/带宽）
 ./build/calcprimelist --to 10000000 --print --out primes.zst --out-format delta16 --zstd
+
+# 保存为 Hugging Face Dataset Viewer 可直接预览的 Parquet
+./build/calcprimelist --to 10000000 --print --out train.parquet --out-format parquet --zstd
 ```
 
 > 支持科学计数法、十六进制与大小后缀：`--to 1e8`、`--to 0x1e5`、`--segment 1M`、`--tile 256K` 等。
@@ -132,8 +135,8 @@ calcprimelist --from A --to B [options]
   --out-groups N      按区间等分为 N 组导出（需 --print --out）
   --out-group-primes X  按每组 X 个素数导出（需 --print --out）
   --out-group-range Y  按每组 Y 个自然数跨度导出（需 --print --out）
-  --out-format FMT    text（默认）| binary | delta16
-  --zstd              对输出字节流做 zstd 压缩（若构建支持）
+  --out-format FMT    text（默认）| binary | delta16 | parquet
+  --zstd              使用 zstd（Parquet 页压缩或输出流压缩；若构建支持）
   --progress          在 stderr 打印分段进度与 ETA
   --time              打印耗时（微秒）
   --stats             打印配置统计（线程、缓存、分段等）
@@ -206,9 +209,30 @@ calcprimelist --from A --to B [options]
 * 从第二个素数开始，每个值写为与前一个素数的差（`int16_t` little-endian，正数）。
 * 若差值超过 `INT16_MAX`，会直接报错（不使用逃逸码/变长编码）。
 
+### `parquet`
+
+* 标准 Parquet 文件，单列名为 `prime`，类型为非空 `uint64`；可被 PyArrow、Pandas、Polars、DuckDB 及 Hugging Face Dataset Viewer 直接识别。
+* 使用 PLAIN 数据编码并按块生成 row group，不需要 Arrow/Thrift 运行库。
+* 建议使用 `.parquet` 扩展名。上传到 Hugging Face Dataset 仓库后即可在线预览，例如：
+
+  ```bash
+  calcprimelist --to 1e8 --print --out train.parquet --out-format parquet --zstd
+  hf upload USER/DATASET train.parquet data/train-00000-of-00001.parquet --repo-type=dataset
+  ```
+
+* 本地读取示例：
+
+  ```python
+  import pyarrow.parquet as pq
+  table = pq.read_table("train.parquet")
+  print(table.schema)       # prime: uint64 not null
+  print(table["prime"][:5])
+  ```
+
 ### `--zstd`（可选压缩开关）
 
-* `--zstd` 不再是输出格式，而是对上述 `text` / `binary` / `delta16` 任一格式的字节流进行 zstd frame 流式压缩。
+* 对 `text` / `binary` / `delta16`，`--zstd` 会将完整输出字节流压缩为标准 zstd frame。
+* 对 `parquet`，`--zstd` 使用 Parquet 内部的 ZSTD 页压缩，文件本身仍是可直接读取的 `.parquet`，不会在外层再套一层 zstd frame。
 * 若当前构建不支持 zstd，传入 `--zstd` 会报错：`zstd not supported in this build`。
 * 兼容别名：`--out-format zstd` 或 `--out-format zstd+delta` 等价于 `--out-format delta16 --zstd`（已弃用）。
 
@@ -316,7 +340,8 @@ typedef enum calcprime_output_format {
     CALCPRIME_OUTPUT_TEXT        = 0,
     CALCPRIME_OUTPUT_BINARY      = 1,
     CALCPRIME_OUTPUT_DELTA16     = 2,
-    CALCPRIME_OUTPUT_ZSTD_DELTA  = CALCPRIME_OUTPUT_DELTA16 // deprecated alias
+    CALCPRIME_OUTPUT_ZSTD_DELTA  = CALCPRIME_OUTPUT_DELTA16, // deprecated alias
+    CALCPRIME_OUTPUT_PARQUET     = 3
 } calcprime_output_format;
 
 struct calcprime_cancel_token;
@@ -350,7 +375,7 @@ typedef struct calcprime_range_options {
     calcprime_progress_callback     progress_callback;    // 可选：进度回调
     void*       progress_user_data;
     calcprime_cancel_token*        cancel_token;         // 可选：可取消
-    int         compress_zstd;      // 1=启用 zstd 压缩（若构建支持）
+    int         compress_zstd;      // 1=启用 zstd；Parquet 使用内部页压缩
 } calcprime_range_options;
 ```
 
@@ -551,7 +576,7 @@ int main() {
 ### 5. 计数与输出
 
 * **计数**：位图就绪后调用 `count_zero_bits(bits, bit_count)`，配合 AVX2/AVX-512（如可用）的 `popcnt` 变体优化。
-* **输出**：`PrimeWriter` 维护一个 I/O 线程与**块队列**（`Chunk`），前端将 `text`/`binary`/`delta16` 编码后的块入队；后端顺序写文件/stdout，且仅在 writer 线程中按需执行 zstd 流式压缩。
+* **输出**：`PrimeWriter` 维护一个 I/O 线程与**块队列**（`Chunk`），前端将 `text`/`binary`/`delta16`/`parquet` 编码后的块入队；后端顺序写文件/stdout，并在 writer 线程中执行 zstd 或 Parquet 页写入。
 
 相关代码：`popcnt.*` / `writer.*`
 
@@ -605,7 +630,7 @@ int main() {
 * **wheel210 bitmap 路径**：`--wheel 210 --wheel-bitmap` 已加入 AVX2 dense 合并与边界段掩码统计优化（默认构建开启 AVX2）；建议在目标机器对 `1e9+` 区间做 A/B 实测后选择。
 * **分段/分块**：若清楚目标平台缓存，可手动设定 `--segment / --tile`；一般保证 **tile ≤ L1D，segment 近似 L2** 会有较好效果。
 * **寻找第 K 个素数**：若内存紧/更稳定，可用 `--threads 1`；并行情况下内部会以段计数推进，也能找到，但需要额外同步与（可能）二次扫描某些段。
-* **输出吞吐**：批量写文件时，优先 `--out-format binary`，或 `--out-format delta16 --zstd`。文本输出人类友好但对磁盘/带宽不友好。
+* **输出吞吐**：批量写文件时，优先 `--out-format binary`、`--out-format delta16 --zstd`，或需要分析/Hugging Face 预览时使用 `--out-format parquet --zstd`。文本输出人类友好但对磁盘/带宽不友好。
 * **分组导出**：`--out-groups` / `--out-group-primes` / `--out-group-range` 三者互斥，且仅在 `--print --out` 下可用。
 * **进度显示**：`--progress` 仅在常规分段路径可用；`--ml` 与 `--wheel-bitmap` 模式下会提示不可用。
 * **边界**：所有计算在 `uint64_t` 范围内进行；请确保 `--from/--to` 满足 `0 ≤ from < to` 且上界不溢出。内部仅标记奇数，`2` 会在前缀处理中单独考虑。

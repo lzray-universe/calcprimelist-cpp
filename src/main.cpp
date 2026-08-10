@@ -223,6 +223,8 @@ void parse_output_format(Options&opts,const std::string&fmt){
 		opts.output_format=PrimeOutputFormat::Binary;
 	}else if(fmt=="delta16"){
 		opts.output_format=PrimeOutputFormat::Delta16;
+	}else if(fmt=="parquet"){
+		opts.output_format=PrimeOutputFormat::Parquet;
 	}else if(fmt=="zstd"||fmt=="zstd+delta"){
 		opts.output_format=PrimeOutputFormat::Delta16;
 		opts.use_zstd=true;
@@ -393,9 +395,9 @@ void print_usage(){
 		<<"  --out-groups N      Split export into N range groups\n"
 		<<"  --out-group-primes X  Split export by X primes per group\n"
 		<<"  --out-group-range Y  Split export by Y natural numbers per group\n"
-		<<"  --out-format FMT    Output format: text (default), binary, delta16\n"
+		<<"  --out-format FMT    Output: text (default), binary, delta16, parquet\n"
 		<<"                    Deprecated aliases: zstd, zstd+delta\n"
-		<<"  --zstd              Compress output stream with zstd (if supported)\n"
+		<<"  --zstd              Use zstd (Parquet pages or whole output stream)\n"
 		<<"  --progress          Show segment progress and ETA on stderr\n"
 		<<"  --time              Print elapsed time\n"
 		<<"  --stats             Print configuration statistics\n"

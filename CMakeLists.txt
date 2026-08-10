@@ -15,6 +15,7 @@ set(CALCPRIME_SOURCES
     src/prime_count.cpp
     src/segmenter.cpp
     src/wheel_bitmap_count.cpp
+    src/parquet_format.cpp
     src/writer.cpp
 )
 
@@ -121,21 +122,36 @@ endif()
 enable_testing()
 
 add_test(NAME prime_sieve_time_100k
-    COMMAND $<TARGET_FILE: calcprimelist> --to 100000 --count --time)
+    COMMAND $<TARGET_FILE:calcprimelist> --to 100000 --count --time)
 set_tests_properties(prime_sieve_time_100k
     PROPERTIES PASS_REGULAR_EXPRESSION "Elapsed: [0-9]+ us")
 
 add_test(NAME prime_sieve_scientific_to_100k
-    COMMAND $<TARGET_FILE: calcprimelist> --to 1e5 --count --time)
+    COMMAND $<TARGET_FILE:calcprimelist> --to 1e5 --count --time)
 set_tests_properties(prime_sieve_scientific_to_100k
     PROPERTIES PASS_REGULAR_EXPRESSION "9592;Elapsed: [0-9]+ us")
 
 add_test(NAME prime_sieve_hex_to_0x1e5_count
-    COMMAND $<TARGET_FILE: calcprimelist> --to 0x1e5 --count)
+    COMMAND $<TARGET_FILE:calcprimelist> --to 0x1e5 --count)
 set_tests_properties(prime_sieve_hex_to_0x1e5_count
     PROPERTIES PASS_REGULAR_EXPRESSION "(^|[^0-9])92([^0-9]|$)")
 
 add_test(NAME prime_sieve_even_only_range_count
-    COMMAND $<TARGET_FILE: calcprimelist> --from 8 --to 9 --count)
+    COMMAND $<TARGET_FILE:calcprimelist> --from 8 --to 9 --count)
 set_tests_properties(prime_sieve_even_only_range_count
     PROPERTIES PASS_REGULAR_EXPRESSION "(^|[^0-9])0([^0-9]|$)")
+
+add_test(NAME prime_sieve_parquet_output
+    COMMAND ${CMAKE_COMMAND}
+        -DCALCPRIME_EXE=$<TARGET_FILE:calcprimelist>
+        -DOUTPUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/ctest-primes.parquet
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_parquet.cmake)
+
+if(CALCPRIME_HAS_ZSTD)
+    add_test(NAME prime_sieve_parquet_zstd_output
+        COMMAND ${CMAKE_COMMAND}
+            -DCALCPRIME_EXE=$<TARGET_FILE:calcprimelist>
+            -DOUTPUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/ctest-primes-zstd.parquet
+            -DUSE_ZSTD=ON
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_parquet.cmake)
+endif()

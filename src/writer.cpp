@@ -1,10 +1,13 @@
 #include "writer.h"
+#include "parquet_format.h"
 
+#include<algorithm>
 #include<cerrno>
 #include<charconv>
 #include<climits>
 #include<cstring>
 #include<exception>
+#include<limits>
 #include<stdexcept>
 
 #if defined(_MSC_VER)
@@ -22,6 +25,8 @@ namespace{
 constexpr std::size_t kDefaultFileBuffer=8u<<20; // 8 MiB
 constexpr std::size_t kDefaultQueueCapacity=8;
 constexpr std::size_t kDefaultBufferThreshold=8u<<20; // 8 MiB
+constexpr std::size_t kParquetRowsPerGroup=1u<<20;
+constexpr char kParquetMagic[]={'P','A','R','1'};
 
 inline std::uint64_t to_little_endian_u64(std::uint64_t value){
 #if defined(__BYTE_ORDER__)&&(__BYTE_ORDER__==__ORDER_BIG_ENDIAN__)
@@ -47,7 +52,8 @@ PrimeWriter::PrimeWriter(bool enabled,const std::string&path,
 	  queue_capacity_(kDefaultQueueCapacity),stop_requested_(false),
 	  buffer_threshold_(kDefaultBufferThreshold),format_(format),
 	  use_zstd_(use_zstd),has_first_prime_(false),previous_prime_(0),
-	  zstd_cctx_(nullptr),io_error_(false){
+	  zstd_cctx_(nullptr),file_offset_(0),parquet_num_rows_(0),
+	  parquet_footer_written_(false),io_error_(false){
 	if(!enabled_){
 		return;
 	}
@@ -72,6 +78,10 @@ PrimeWriter::PrimeWriter(bool enabled,const std::string&path,
 
 	if(std::setvbuf(file_,nullptr,_IOFBF,kDefaultFileBuffer)!=0){
 		throw std::runtime_error("Failed to set file buffer");
+	}
+	if(format_==PrimeOutputFormat::Parquet){
+		write_file_bytes(kParquetMagic,sizeof(kParquetMagic));
+		check_io_error();
 	}
 
 	if(use_zstd_){
@@ -152,6 +162,24 @@ void PrimeWriter::write_segment(const std::vector<std::uint64_t>&primes){
 		}
 		break;
 	}
+	case PrimeOutputFormat::Parquet:{
+		for(std::size_t offset=0;offset<primes.size();){
+			std::size_t count=std::min(kParquetRowsPerGroup,
+								 primes.size()-offset);
+			std::string data;
+			data.resize(count*sizeof(std::uint64_t));
+			char*dest=data.data();
+			for(std::size_t i=0;i<count;++i){
+				std::uint64_t encoded=to_little_endian_u64(primes[offset+i]);
+				std::memcpy(dest,&encoded,sizeof(encoded));
+				dest+=sizeof(encoded);
+			}
+			enqueue_chunk(Chunk{std::move(data),false,
+								static_cast<std::uint64_t>(count)});
+			offset+=count;
+		}
+		break;
+	}
 	}
 }
 
@@ -183,6 +211,12 @@ void PrimeWriter::write_value(std::uint64_t value){
 		if(!data.empty()){
 			enqueue_chunk(Chunk{std::move(data),false});
 		}
+		break;
+	}
+	case PrimeOutputFormat::Parquet:{
+		std::uint64_t encoded=to_little_endian_u64(value);
+		std::string chunk(reinterpret_cast<const char*>(&encoded),sizeof(encoded));
+		enqueue_chunk(Chunk{std::move(chunk),false,1});
 		break;
 	}
 	}
@@ -293,28 +327,36 @@ void PrimeWriter::writer_loop(){
 			queue_not_full_.notify_one();
 		}
 
-		if(!chunk.data.empty()){
+		if(format_==PrimeOutputFormat::Parquet&&!chunk.data.empty()){
+			write_parquet_chunk(chunk);
+		}else if(!chunk.data.empty()){
 			buffer_.append(chunk.data);
 			if(buffer_.size()>=buffer_threshold_){
 				flush_buffer();
 			}
 		}
 		if(chunk.flush){
-			flush_buffer();
+			if(format_!=PrimeOutputFormat::Parquet){
+				flush_buffer();
 #if defined(CALCPRIME_HAS_ZSTD)
-			if(use_zstd_){
-				flush_zstd_stream(false);
-			}
+				if(use_zstd_){
+					flush_zstd_stream(false);
+				}
 #endif
+			}
 			if(file_&&std::fflush(file_)!=0){
 				set_error(std::strerror(errno));
 			}
 		}
 	}
 
-	flush_buffer();
+	if(format_==PrimeOutputFormat::Parquet){
+		write_parquet_footer();
+	}else{
+		flush_buffer();
+	}
 #if defined(CALCPRIME_HAS_ZSTD)
-	if(use_zstd_){
+	if(use_zstd_&&format_!=PrimeOutputFormat::Parquet){
 		flush_zstd_stream(true);
 	}
 #endif
@@ -494,7 +536,103 @@ void PrimeWriter::write_file_bytes(const char*data,std::size_t size){
 		}
 		cursor+=written;
 		remaining-=written;
+		file_offset_+=static_cast<std::uint64_t>(written);
 	}
+}
+
+void PrimeWriter::write_parquet_chunk(const Chunk&chunk){
+	if(chunk.value_count==0||chunk.data.empty()){
+		return;
+	}
+	if(chunk.value_count>
+	   static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())||
+	   chunk.data.size()>
+		   static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())){
+		set_error("Parquet data page exceeds the supported 2 GiB limit");
+		return;
+	}
+
+	const std::string*payload=&chunk.data;
+	std::string compressed;
+#if defined(CALCPRIME_HAS_ZSTD)
+	if(use_zstd_){
+		std::size_t bound=ZSTD_compressBound(chunk.data.size());
+		compressed.resize(bound);
+		std::size_t result=ZSTD_compress2(
+			static_cast<ZSTD_CCtx*>(zstd_cctx_),compressed.data(),
+			compressed.size(),chunk.data.data(),chunk.data.size());
+		if(ZSTD_isError(result)){
+			std::string message="zstd compress error: ";
+			message.append(ZSTD_getErrorName(result));
+			set_error(message);
+			return;
+		}
+		compressed.resize(result);
+		payload=&compressed;
+	}
+#else
+	if(use_zstd_){
+		set_error("zstd not supported in this build");
+		return;
+	}
+#endif
+
+	if(payload->size()>
+	   static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())){
+		set_error("Compressed Parquet data page exceeds the supported 2 GiB limit");
+		return;
+	}
+
+	std::string header=parquet::make_data_page_header(
+		static_cast<std::int32_t>(chunk.value_count),
+		static_cast<std::int32_t>(chunk.data.size()),
+		static_cast<std::int32_t>(payload->size()));
+	std::uint64_t page_offset=file_offset_;
+	write_file_bytes(header.data(),header.size());
+	write_file_bytes(payload->data(),payload->size());
+	if(io_error_.load(std::memory_order_acquire)){
+		return;
+	}
+
+	ParquetRowGroup row_group;
+	row_group.data_page_offset=static_cast<std::int64_t>(page_offset);
+	row_group.num_values=static_cast<std::int64_t>(chunk.value_count);
+	row_group.total_uncompressed_size=static_cast<std::int64_t>(
+		header.size()+chunk.data.size());
+	row_group.total_compressed_size=static_cast<std::int64_t>(
+		header.size()+payload->size());
+	parquet_row_groups_.push_back(row_group);
+	parquet_num_rows_+=chunk.value_count;
+}
+
+void PrimeWriter::write_parquet_footer(){
+	if(parquet_footer_written_||io_error_.load(std::memory_order_acquire)){
+		return;
+	}
+	std::vector<parquet::RowGroupMetadata> metadata;
+	metadata.reserve(parquet_row_groups_.size());
+	for(const ParquetRowGroup&row_group : parquet_row_groups_){
+		metadata.push_back(parquet::RowGroupMetadata{
+			row_group.data_page_offset,row_group.num_values,
+			row_group.total_uncompressed_size,row_group.total_compressed_size});
+	}
+	std::string footer=parquet::make_file_metadata(
+		metadata,static_cast<std::int64_t>(parquet_num_rows_),use_zstd_);
+	if(footer.size()>std::numeric_limits<std::uint32_t>::max()){
+		set_error("Parquet footer exceeds the 4 GiB format limit");
+		return;
+	}
+	write_file_bytes(footer.data(),footer.size());
+	std::uint32_t footer_size=static_cast<std::uint32_t>(footer.size());
+	char length[4]={
+		static_cast<char>(footer_size&0xffU),
+		static_cast<char>((footer_size>>8U)&0xffU),
+		static_cast<char>((footer_size>>16U)&0xffU),
+		static_cast<char>((footer_size>>24U)&0xffU),
+	};
+	write_file_bytes(length,sizeof(length));
+	write_file_bytes(kParquetMagic,sizeof(kParquetMagic));
+	parquet_footer_written_=!io_error_.load(std::memory_order_acquire);
 }
 
 #if defined(CALCPRIME_HAS_ZSTD)
