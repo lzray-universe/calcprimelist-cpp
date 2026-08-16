@@ -6,6 +6,13 @@ set(extra_args)
 if(USE_ZSTD)
     list(APPEND extra_args --zstd)
 endif()
+if(USE_DELTA)
+    list(APPEND extra_args --parquet-encoding delta)
+    if(DEFINED DELTA_BLOCK_VALUES)
+        list(APPEND extra_args --parquet-delta-block-values
+             "${DELTA_BLOCK_VALUES}")
+    endif()
+endif()
 
 execute_process(
     COMMAND "${CALCPRIME_EXE}" --from 1 --to 100 --print

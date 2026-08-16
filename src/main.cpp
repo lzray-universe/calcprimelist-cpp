@@ -60,6 +60,9 @@ struct Options{
 	std::string output_index_path;
 	PrimeOutputFormat output_format=PrimeOutputFormat::Text;
 	bool use_zstd=false;
+	ParquetEncoding parquet_encoding=ParquetEncoding::Plain;
+	std::size_t parquet_delta_block_values=128;
+	bool parquet_delta_block_values_set=false;
 	std::uint64_t output_group_count=0;
 	std::uint64_t output_group_primes=0;
 	std::uint64_t output_group_range=0;
@@ -237,17 +240,43 @@ void parse_output_format(Options&opts,const std::string&fmt){
 	}
 }
 
+void parse_parquet_encoding(Options&opts,const std::string&encoding){
+	if(encoding=="plain"){
+		opts.parquet_encoding=ParquetEncoding::Plain;
+	}else if(encoding=="delta"||encoding=="delta-binary-packed"||
+			 encoding=="DELTA_BINARY_PACKED"){
+		opts.parquet_encoding=ParquetEncoding::DeltaBinaryPacked;
+	}else{
+		throw std::invalid_argument("unsupported parquet encoding: "+encoding);
+	}
+}
+
 Options parse_options(int argc,char**argv){
 	Options opts;
 	for(int i=1;i<argc;++i){
 		std::string arg=argv[i];
 		static const std::string out_format_prefix="--out-format=";
+		static const std::string parquet_encoding_prefix=
+			"--parquet-encoding=";
+		static const std::string parquet_block_prefix=
+			"--parquet-delta-block-values=";
 
 		if(arg=="--help"||arg=="-h"){
 			opts.help=true;
 			return opts;
 		}else if(arg.rfind(out_format_prefix,0)==0){
 			parse_output_format(opts,arg.substr(out_format_prefix.size()));
+		}else if(arg.rfind(parquet_encoding_prefix,0)==0){
+			parse_parquet_encoding(
+				opts,arg.substr(parquet_encoding_prefix.size()));
+		}else if(arg.rfind(parquet_block_prefix,0)==0){
+			std::uint64_t value=parse_u64(arg.substr(parquet_block_prefix.size()));
+			if(value>std::numeric_limits<std::size_t>::max()){
+				throw std::invalid_argument(
+					"--parquet-delta-block-values is too large");
+			}
+			opts.parquet_delta_block_values=static_cast<std::size_t>(value);
+			opts.parquet_delta_block_values_set=true;
 		}else if(arg=="--from"){
 			if(i+1>=argc){
 				throw std::invalid_argument("--from requires a value");
@@ -353,6 +382,24 @@ Options parse_options(int argc,char**argv){
 			parse_output_format(opts,argv[++i]);
 		}else if(arg=="--zstd"){
 			opts.use_zstd=true;
+		}else if(arg=="--parquet-encoding"){
+			if(i+1>=argc){
+				throw std::invalid_argument(
+					"--parquet-encoding requires a value");
+			}
+			parse_parquet_encoding(opts,argv[++i]);
+		}else if(arg=="--parquet-delta-block-values"){
+			if(i+1>=argc){
+				throw std::invalid_argument(
+					"--parquet-delta-block-values requires a value");
+			}
+			std::uint64_t value=parse_u64(argv[++i]);
+			if(value>std::numeric_limits<std::size_t>::max()){
+				throw std::invalid_argument(
+					"--parquet-delta-block-values is too large");
+			}
+			opts.parquet_delta_block_values=static_cast<std::size_t>(value);
+			opts.parquet_delta_block_values_set=true;
 		}else if(arg=="--progress"){
 			opts.show_progress=true;
 		}else if(arg=="--time"){
@@ -398,6 +445,9 @@ void print_usage(){
 		<<"  --out-format FMT    Output: text (default), binary, delta16, parquet\n"
 		<<"                    Deprecated aliases: zstd, zstd+delta\n"
 		<<"  --zstd              Use zstd (Parquet pages or whole output stream)\n"
+		<<"  --parquet-encoding E  Parquet values: plain (default) or delta\n"
+		<<"  --parquet-delta-block-values N\n"
+		<<"                       Delta values per block; multiple of 128\n"
 		<<"  --progress          Show segment progress and ETA on stderr\n"
 		<<"  --time              Print elapsed time\n"
 		<<"  --stats             Print configuration statistics\n"
@@ -752,6 +802,8 @@ class GroupedPrimeExporter{
   public:
 	GroupedPrimeExporter(const std::string&base_output_path,
 						 PrimeOutputFormat output_format,bool use_zstd,
+						 ParquetEncoding parquet_encoding,
+						 std::size_t parquet_delta_block_values,
 						 std::uint64_t range_from,std::uint64_t range_to,
 						 const OutputGroupingConfig&config)
 		: base_output_path_(base_output_path),
@@ -759,6 +811,8 @@ class GroupedPrimeExporter{
 						  ?(base_output_path+".index.tsv")
 						  :config.index_path),
 		  output_format_(output_format),use_zstd_(use_zstd),
+		  parquet_encoding_(parquet_encoding),
+		  parquet_delta_block_values_(parquet_delta_block_values),
 		  range_from_(range_from),range_to_(range_to),mode_(config.mode){
 		if(base_output_path_.empty()){
 			throw std::invalid_argument("grouped export requires --out PATH");
@@ -977,7 +1031,8 @@ class GroupedPrimeExporter{
 		std::uint64_t id=static_cast<std::uint64_t>(records_.size())+1ULL;
 		std::string file_path=build_group_file_path(id);
 		current_writer_=std::make_unique<PrimeWriter>(
-			true,file_path,output_format_,use_zstd_);
+			true,file_path,output_format_,use_zstd_,parquet_encoding_,
+			parquet_delta_block_values_);
 		GroupIndexRecord record;
 		record.id=id;
 		record.file_path=file_path;
@@ -1079,6 +1134,8 @@ class GroupedPrimeExporter{
 	OutputPathParts path_parts_;
 	PrimeOutputFormat output_format_=PrimeOutputFormat::Text;
 	bool use_zstd_=false;
+	ParquetEncoding parquet_encoding_=ParquetEncoding::Plain;
+	std::size_t parquet_delta_block_values_=128;
 	std::uint64_t range_from_=0;
 	std::uint64_t range_to_=0;
 	OutputGroupingMode mode_=OutputGroupingMode::None;
@@ -1357,9 +1414,11 @@ void validate_self_test_options(const Options&opts){
 		throw std::invalid_argument(
 			"--stest supports count benchmarking only");
 	}
-	if(opts.use_zstd||opts.output_format!=PrimeOutputFormat::Text){
+	if(opts.use_zstd||opts.output_format!=PrimeOutputFormat::Text||
+	   opts.parquet_encoding!=ParquetEncoding::Plain||
+	   opts.parquet_delta_block_values_set){
 		throw std::invalid_argument(
-			"--stest does not support output-format or zstd options");
+			"--stest does not support output-format, zstd, or Parquet options");
 	}
 	if(opts.use_ml){
 		throw std::invalid_argument("--stest does not support --ml");
@@ -1607,6 +1666,23 @@ int run_cli(int argc,char**argv){
 		}
 		if(opts.self_test){
 			return run_self_test(opts);
+		}
+		if(opts.parquet_encoding!=ParquetEncoding::Plain&&
+		   opts.output_format!=PrimeOutputFormat::Parquet){
+			throw std::invalid_argument(
+				"--parquet-encoding=delta requires --out-format parquet");
+		}
+		if(opts.parquet_delta_block_values_set&&
+		   opts.parquet_encoding!=ParquetEncoding::DeltaBinaryPacked){
+			throw std::invalid_argument(
+				"--parquet-delta-block-values requires --parquet-encoding delta");
+		}
+		if(opts.parquet_encoding==ParquetEncoding::DeltaBinaryPacked&&
+		   (opts.parquet_delta_block_values==0||
+			(opts.parquet_delta_block_values%128U)!=0U||
+			opts.parquet_delta_block_values>(1U<<20))){
+			throw std::invalid_argument(
+				"Parquet delta block values must be a multiple of 128 between 128 and 1048576");
 		}
 #if !defined(CALCPRIME_HAS_ZSTD)
 		if(opts.use_zstd){
@@ -1910,12 +1986,15 @@ int run_cli(int argc,char**argv){
 		std::unique_ptr<GroupedPrimeExporter> grouped_exporter;
 		if(grouping_config.mode!=OutputGroupingMode::None){
 			grouped_exporter=std::make_unique<GroupedPrimeExporter>(
-				opts.output_path,opts.output_format,opts.use_zstd,opts.from,
-				opts.to,grouping_config);
+				opts.output_path,opts.output_format,opts.use_zstd,
+				opts.parquet_encoding,opts.parquet_delta_block_values,
+				opts.from,opts.to,grouping_config);
 		}else{
 			writer=std::make_unique<PrimeWriter>(opts.print_primes,
-											 opts.output_path,
-											 opts.output_format,opts.use_zstd);
+										 opts.output_path,
+										 opts.output_format,opts.use_zstd,
+										 opts.parquet_encoding,
+										 opts.parquet_delta_block_values);
 		}
 		std::mutex writer_exception_mutex;
 		std::exception_ptr writer_exception;

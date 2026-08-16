@@ -94,6 +94,11 @@ Build targets:
 
 # Save as Parquet for direct preview in the Hugging Face Dataset Viewer
 ./build/calcprimelist --to 10000000 --print --out train.parquet --out-format parquet --zstd
+
+# DELTA_BINARY_PACKED with 256 deltas per block and ZSTD page compression
+./build/calcprimelist --to 10000000 --print --out train-delta.parquet \
+  --out-format parquet --parquet-encoding delta \
+  --parquet-delta-block-values 256 --zstd
 ```
 
 > Scientific notation, hexadecimal values, and size suffixes are supported: `--to 1e8`, `--to 0x1e5`, `--segment 1M`, `--tile 256K`, etc.
@@ -127,6 +132,9 @@ calcprimelist --from A --to B [options]
   --out-group-range Y  Split export by Y natural numbers per group (requires --print --out)
   --out-format FMT    text (default) | binary | delta16 | parquet
   --zstd              Use zstd (Parquet pages or whole output stream)
+  --parquet-encoding E  Parquet value encoding: plain (default) or delta
+  --parquet-delta-block-values N
+                       Deltas per block; must be a multiple of 128
   --progress          Show segment progress and ETA on stderr
   --time              Print elapsed time (microseconds)
   --stats             Print configuration stats (threads, cache, segments, etc.)
@@ -202,7 +210,9 @@ calcprimelist --from A --to B [options]
 ### `parquet`
 
 * A standard Parquet file with one required `uint64` column named `prime`; directly readable by PyArrow, Pandas, Polars, DuckDB, and the Hugging Face Dataset Viewer.
-* Uses PLAIN data encoding and writes row groups incrementally without an Arrow or Thrift runtime dependency.
+* `--parquet-encoding delta` selects standard `DELTA_BINARY_PACKED`. Each block first attempts to hold adjacent differences in a `uint16_t` buffer and automatically falls back to the 64-bit path when needed.
+* `--parquet-delta-block-values N` controls the number of deltas per block. It accepts multiples of 128 from 128 through 1048576 and defaults to 128. Miniblocks contain 32 deltas and select their bit widths automatically.
+* Uses PLAIN data encoding by default and writes row groups incrementally without an Arrow or Thrift runtime dependency.
 * Use the `.parquet` extension. After uploading it to a Hugging Face dataset repository, the file can be previewed online:
 
   ```bash
@@ -223,6 +233,7 @@ calcprimelist --from A --to B [options]
 
 * For `text`, `binary`, and `delta16`, `--zstd` compresses the complete output byte stream into a standard zstd frame.
 * For `parquet`, `--zstd` selects Parquet's internal ZSTD page codec. The result remains a directly readable `.parquet` file and is not wrapped in an outer zstd frame.
+* `DELTA_BINARY_PACKED` is a value encoding and ZSTD is page compression, so both can be enabled together.
 * If the current build has no zstd support, `--zstd` fails with `zstd not supported in this build`.
 * Compatibility aliases: `--out-format zstd` and `--out-format zstd+delta` map to `--out-format delta16 --zstd` (deprecated).
 
@@ -366,6 +377,8 @@ typedef struct calcprime_range_options {
     void*       progress_user_data;
     calcprime_cancel_token*        cancel_token;         // optional: cancellable
     int         compress_zstd;      // 1 = enable zstd; Parquet uses page compression
+    calcprime_parquet_encoding parquet_encoding;
+    size_t      parquet_delta_block_values; // default 128; multiple of 128
 } calcprime_range_options;
 ```
 

@@ -53,6 +53,11 @@ typedef enum calcprime_output_format{
 	CALCPRIME_OUTPUT_PARQUET=3
 } calcprime_output_format;
 
+typedef enum calcprime_parquet_encoding{
+	CALCPRIME_PARQUET_ENCODING_PLAIN=0,
+	CALCPRIME_PARQUET_ENCODING_DELTA_BINARY_PACKED=5
+} calcprime_parquet_encoding;
+
 struct calcprime_cancel_token;
 typedef struct calcprime_cancel_token calcprime_cancel_token;
 
@@ -80,6 +85,8 @@ typedef struct calcprime_range_options{
 	void*progress_user_data;
 	calcprime_cancel_token*cancel_token;
 	int compress_zstd;
+	calcprime_parquet_encoding parquet_encoding;
+	std::size_t parquet_delta_block_values;
 } calcprime_range_options;
 
 typedef struct calcprime_range_stats{

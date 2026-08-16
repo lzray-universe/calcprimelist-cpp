@@ -19,11 +19,18 @@ enum class PrimeOutputFormat{
 	Parquet,
 };
 
+enum class ParquetEncoding{
+	Plain,
+	DeltaBinaryPacked,
+};
+
 class PrimeWriter{
   public:
 	PrimeWriter(bool enabled,const std::string&path="",
 				PrimeOutputFormat format=PrimeOutputFormat::Text,
-				bool use_zstd=false);
+				bool use_zstd=false,
+				ParquetEncoding parquet_encoding=ParquetEncoding::Plain,
+				std::size_t parquet_delta_block_values=128);
 	~PrimeWriter();
 
 	bool enabled() const{ return enabled_; }
@@ -77,6 +84,8 @@ class PrimeWriter{
 
 	PrimeOutputFormat format_;
 	bool use_zstd_;
+	ParquetEncoding parquet_encoding_;
+	std::size_t parquet_delta_block_values_;
 	bool has_first_prime_;
 	std::uint64_t previous_prime_;
 	void*zstd_cctx_;

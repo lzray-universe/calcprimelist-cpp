@@ -1,8 +1,13 @@
 #include "parquet_format.h"
 
+#include<algorithm>
+#include<bit>
 #include<cstddef>
 #include<cstdint>
+#include<limits>
+#include<stdexcept>
 #include<string>
+#include<vector>
 
 namespace calcprime::parquet{
 
@@ -127,13 +132,13 @@ void append_prime_schema(std::string&out){
 }
 
 void append_column_metadata(std::string&out,const RowGroupMetadata&row_group,
-							bool use_zstd){
+							bool use_zstd,ValueEncoding encoding){
 	std::int16_t last=0;
 	append_i32_field(out,last,1,2); // Type::INT64
 
 	append_field_header(out,last,2,CompactList);
 	append_list_header(out,2,CompactI32);
-	append_uvarint(out,zigzag_i64(0)); // Encoding::PLAIN
+	append_uvarint(out,zigzag_i64(static_cast<std::int32_t>(encoding)));
 	append_uvarint(out,zigzag_i64(3)); // Encoding::RLE (level encoding)
 
 	append_field_header(out,last,3,CompactList);
@@ -150,22 +155,22 @@ void append_column_metadata(std::string&out,const RowGroupMetadata&row_group,
 }
 
 void append_column_chunk(std::string&out,const RowGroupMetadata&row_group,
-						 bool use_zstd){
+						 bool use_zstd,ValueEncoding encoding){
 	std::int16_t last=0;
 	// parquet.thrift requires this deprecated field and recommends zero when
 	// column metadata lives only in the footer.
 	append_i64_field(out,last,2,0);
 	append_field_header(out,last,3,CompactStruct);
-	append_column_metadata(out,row_group,use_zstd);
+	append_column_metadata(out,row_group,use_zstd,encoding);
 	append_stop(out);
 }
 
 void append_row_group(std::string&out,const RowGroupMetadata&row_group,
-					  bool use_zstd){
+					  bool use_zstd,ValueEncoding encoding){
 	std::int16_t last=0;
 	append_field_header(out,last,1,CompactList);
 	append_list_header(out,1,CompactStruct);
-	append_column_chunk(out,row_group,use_zstd);
+	append_column_chunk(out,row_group,use_zstd,encoding);
 	append_i64_field(out,last,2,row_group.total_uncompressed_size);
 	append_i64_field(out,last,3,row_group.num_values);
 	append_i64_field(out,last,5,row_group.data_page_offset);
@@ -173,20 +178,95 @@ void append_row_group(std::string&out,const RowGroupMetadata&row_group,
 	append_stop(out);
 }
 
-void append_data_page_header(std::string&out,std::int32_t num_values){
+void append_data_page_header(std::string&out,std::int32_t num_values,
+							 ValueEncoding encoding){
 	std::int16_t last=0;
 	append_i32_field(out,last,1,num_values);
-	append_i32_field(out,last,2,0); // Encoding::PLAIN
+	append_i32_field(out,last,2,static_cast<std::int32_t>(encoding));
 	append_i32_field(out,last,3,3); // Encoding::RLE
 	append_i32_field(out,last,4,3); // Encoding::RLE
 	append_stop(out);
+}
+
+unsigned bit_width(std::uint64_t value){
+	return value==0?0U:64U-std::countl_zero(value);
+}
+
+void append_bit_packed(std::string&out,const std::uint64_t*values,
+					   std::size_t count,unsigned width){
+	if(width==0){
+		return;
+	}
+	std::uint64_t buffer=0;
+	unsigned buffered_bits=0;
+	for(std::size_t i=0;i<count;++i){
+		std::uint64_t value=values[i];
+		unsigned remaining=width;
+		while(remaining>0){
+			unsigned room=64U-buffered_bits;
+			unsigned take=std::min(remaining,room);
+			std::uint64_t mask=
+				(take==64U)?std::numeric_limits<std::uint64_t>::max()
+						   :((std::uint64_t{1}<<take)-1U);
+			buffer|=(value&mask)<<buffered_bits;
+			if(take<64U){
+				value>>=take;
+			}
+			buffered_bits+=take;
+			remaining-=take;
+			while(buffered_bits>=8U){
+				out.push_back(static_cast<char>(buffer&0xffU));
+				buffer>>=8U;
+				buffered_bits-=8U;
+			}
+		}
+	}
+	if(buffered_bits!=0U){
+		out.push_back(static_cast<char>(buffer&0xffU));
+	}
+}
+
+template<class Delta>
+void append_delta_block(std::string&out,const std::vector<Delta>&deltas,
+						std::size_t mini_block_count,
+						std::size_t values_per_mini_block){
+	Delta min_delta=*std::min_element(deltas.begin(),deltas.end());
+	append_uvarint(out,zigzag_i64(static_cast<std::int64_t>(min_delta)));
+
+	std::vector<std::uint8_t> widths(mini_block_count,0);
+	std::size_t used_mini_blocks=
+		(deltas.size()+values_per_mini_block-1U)/values_per_mini_block;
+	for(std::size_t mini=0;mini<used_mini_blocks;++mini){
+		std::size_t begin=mini*values_per_mini_block;
+		std::size_t end=std::min(begin+values_per_mini_block,deltas.size());
+		std::uint64_t max_adjusted=0;
+		for(std::size_t i=begin;i<end;++i){
+			max_adjusted=std::max(
+				max_adjusted,static_cast<std::uint64_t>(deltas[i]-min_delta));
+		}
+		widths[mini]=static_cast<std::uint8_t>(bit_width(max_adjusted));
+	}
+	out.append(reinterpret_cast<const char*>(widths.data()),widths.size());
+
+	std::vector<std::uint64_t> adjusted(values_per_mini_block,0);
+	for(std::size_t mini=0;mini<used_mini_blocks;++mini){
+		std::fill(adjusted.begin(),adjusted.end(),0);
+		std::size_t begin=mini*values_per_mini_block;
+		std::size_t end=std::min(begin+values_per_mini_block,deltas.size());
+		for(std::size_t i=begin;i<end;++i){
+			adjusted[i-begin]=
+				static_cast<std::uint64_t>(deltas[i]-min_delta);
+		}
+		append_bit_packed(out,adjusted.data(),adjusted.size(),widths[mini]);
+	}
 }
 
 } // namespace
 
 std::string make_data_page_header(std::int32_t num_values,
 								  std::int32_t uncompressed_size,
-								  std::int32_t compressed_size){
+								  std::int32_t compressed_size,
+								  ValueEncoding encoding){
 	std::string out;
 	out.reserve(32);
 	std::int16_t last=0;
@@ -194,13 +274,14 @@ std::string make_data_page_header(std::int32_t num_values,
 	append_i32_field(out,last,2,uncompressed_size);
 	append_i32_field(out,last,3,compressed_size);
 	append_field_header(out,last,5,CompactStruct);
-	append_data_page_header(out,num_values);
+	append_data_page_header(out,num_values,encoding);
 	append_stop(out);
 	return out;
 }
 
 std::string make_file_metadata(const std::vector<RowGroupMetadata>&row_groups,
-							   std::int64_t num_rows,bool use_zstd){
+							   std::int64_t num_rows,bool use_zstd,
+							   ValueEncoding encoding){
 	std::string out;
 	out.reserve(128+row_groups.size()*64);
 	std::int16_t last=0;
@@ -215,11 +296,92 @@ std::string make_file_metadata(const std::vector<RowGroupMetadata>&row_groups,
 	append_field_header(out,last,4,CompactList);
 	append_list_header(out,row_groups.size(),CompactStruct);
 	for(const RowGroupMetadata&row_group : row_groups){
-		append_row_group(out,row_group,use_zstd);
+		append_row_group(out,row_group,use_zstd,encoding);
 	}
 
 	append_binary_field(out,last,6,"calcprimelist-cpp");
 	append_stop(out);
+	return out;
+}
+
+std::string encode_delta_binary_packed(const std::uint64_t*values,
+									   std::size_t count,
+									   std::size_t block_value_count){
+	if(block_value_count==0||(block_value_count%128U)!=0U){
+		throw std::invalid_argument(
+			"Parquet delta block value count must be a positive multiple of 128");
+	}
+	if(count==0){
+		return {};
+	}
+	if(!values){
+		throw std::invalid_argument("Parquet delta values pointer is null");
+	}
+	if(values[0]>
+	   static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())){
+		throw std::overflow_error(
+			"DELTA_BINARY_PACKED requires values within signed INT64 range");
+	}
+
+	constexpr std::size_t values_per_mini_block=32;
+	std::size_t mini_block_count=block_value_count/values_per_mini_block;
+	std::string out;
+	out.reserve(count*2U+32U);
+	append_uvarint(out,static_cast<std::uint64_t>(block_value_count));
+	append_uvarint(out,static_cast<std::uint64_t>(mini_block_count));
+	append_uvarint(out,static_cast<std::uint64_t>(count));
+	append_uvarint(out,zigzag_i64(static_cast<std::int64_t>(values[0])));
+
+	std::size_t offset=1;
+	while(offset<count){
+		std::size_t delta_count=std::min(block_value_count,count-offset);
+		bool fits_u16=true;
+		std::vector<std::uint16_t> deltas16;
+		deltas16.reserve(delta_count);
+		std::uint64_t previous=values[offset-1U];
+		for(std::size_t i=0;i<delta_count;++i){
+			std::uint64_t current=values[offset+i];
+			if(current>static_cast<std::uint64_t>(
+						 std::numeric_limits<std::int64_t>::max())){
+				throw std::overflow_error(
+					"DELTA_BINARY_PACKED requires values within signed INT64 range");
+			}
+			if(current<previous){
+				throw std::invalid_argument(
+					"Parquet DELTA_BINARY_PACKED values must be non-decreasing");
+			}
+			std::uint64_t delta=current-previous;
+			if(delta>static_cast<std::uint64_t>(
+						 std::numeric_limits<std::int64_t>::max())){
+				throw std::overflow_error(
+					"Parquet DELTA_BINARY_PACKED delta exceeds INT64 range");
+			}
+			if(delta>std::numeric_limits<std::uint16_t>::max()){
+				fits_u16=false;
+			}
+			if(fits_u16){
+				deltas16.push_back(static_cast<std::uint16_t>(delta));
+			}
+			previous=current;
+		}
+
+		if(fits_u16){
+			append_delta_block(out,deltas16,mini_block_count,
+							   values_per_mini_block);
+		}else{
+			std::vector<std::uint64_t> deltas64;
+			deltas64.reserve(delta_count);
+			previous=values[offset-1U];
+			for(std::size_t i=0;i<delta_count;++i){
+				std::uint64_t current=values[offset+i];
+				deltas64.push_back(current-previous);
+				previous=current;
+			}
+			append_delta_block(out,deltas64,mini_block_count,
+							   values_per_mini_block);
+		}
+		offset+=delta_count;
+	}
 	return out;
 }
 

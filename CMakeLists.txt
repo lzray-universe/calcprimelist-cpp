@@ -147,11 +147,28 @@ add_test(NAME prime_sieve_parquet_output
         -DOUTPUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/ctest-primes.parquet
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_parquet.cmake)
 
+add_test(NAME prime_sieve_parquet_delta_output
+    COMMAND ${CMAKE_COMMAND}
+        -DCALCPRIME_EXE=$<TARGET_FILE:calcprimelist>
+        -DOUTPUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/ctest-primes-delta.parquet
+        -DUSE_DELTA=ON
+        -DDELTA_BLOCK_VALUES=256
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_parquet.cmake)
+
 if(CALCPRIME_HAS_ZSTD)
     add_test(NAME prime_sieve_parquet_zstd_output
         COMMAND ${CMAKE_COMMAND}
             -DCALCPRIME_EXE=$<TARGET_FILE:calcprimelist>
             -DOUTPUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/ctest-primes-zstd.parquet
+            -DUSE_ZSTD=ON
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_parquet.cmake)
+
+    add_test(NAME prime_sieve_parquet_delta_zstd_output
+        COMMAND ${CMAKE_COMMAND}
+            -DCALCPRIME_EXE=$<TARGET_FILE:calcprimelist>
+            -DOUTPUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/ctest-primes-delta-zstd.parquet
+            -DUSE_DELTA=ON
+            -DDELTA_BLOCK_VALUES=128
             -DUSE_ZSTD=ON
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_parquet.cmake)
 endif()

@@ -45,6 +45,23 @@ bool is_valid_output_format(calcprime_output_format format){
 	return false;
 }
 
+bool is_valid_parquet_encoding(calcprime_parquet_encoding encoding){
+	switch(encoding){
+	case CALCPRIME_PARQUET_ENCODING_PLAIN:
+	case CALCPRIME_PARQUET_ENCODING_DELTA_BINARY_PACKED:
+		return true;
+	}
+	return false;
+}
+
+calcprime::ParquetEncoding
+to_cpp_parquet_encoding(calcprime_parquet_encoding encoding){
+	if(encoding==CALCPRIME_PARQUET_ENCODING_DELTA_BINARY_PACKED){
+		return calcprime::ParquetEncoding::DeltaBinaryPacked;
+	}
+	return calcprime::ParquetEncoding::Plain;
+}
+
 calcprime::WheelType to_cpp_wheel(calcprime_wheel_type type){
 	switch(type){
 	case CALCPRIME_WHEEL_MOD30:
@@ -140,6 +157,9 @@ struct RangeOptions{
 	bool compress_zstd=false;
 	calcprime::PrimeOutputFormat output_format=
 		calcprime::PrimeOutputFormat::Text;
+	calcprime::ParquetEncoding parquet_encoding=
+		calcprime::ParquetEncoding::Plain;
+	std::size_t parquet_delta_block_values=128;
 	std::string output_path;
 	calcprime_prime_chunk_callback prime_callback=nullptr;
 	void*prime_user_data=nullptr;
@@ -162,6 +182,8 @@ RangeOptions make_range_options(const calcprime_range_options&opts){
 	result.write_to_file=opts.write_to_file!=0;
 	result.compress_zstd=opts.compress_zstd!=0;
 	result.output_format=to_cpp_output(opts.output_format);
+	result.parquet_encoding=to_cpp_parquet_encoding(opts.parquet_encoding);
+	result.parquet_delta_block_values=opts.parquet_delta_block_values;
 	if(opts.output_path){
 		result.output_path=opts.output_path;
 	}
@@ -344,6 +366,8 @@ extern "C" int calcprime_range_options_init(calcprime_range_options*options){
 	options->progress_user_data=nullptr;
 	options->cancel_token=nullptr;
 	options->compress_zstd=0;
+	options->parquet_encoding=CALCPRIME_PARQUET_ENCODING_PLAIN;
+	options->parquet_delta_block_values=128;
 	return 0;
 }
 
@@ -415,6 +439,29 @@ calcprime_run_range(const calcprime_range_options*options,
 	}
 	if(!is_valid_output_format(options->output_format)){
 		result->error_message="invalid output format";
+		*out_result=result.release();
+		return CALCPRIME_STATUS_INVALID_ARGUMENT;
+	}
+	if(!is_valid_parquet_encoding(options->parquet_encoding)){
+		result->error_message="invalid Parquet encoding";
+		*out_result=result.release();
+		return CALCPRIME_STATUS_INVALID_ARGUMENT;
+	}
+	if(options->parquet_encoding==
+		   CALCPRIME_PARQUET_ENCODING_DELTA_BINARY_PACKED&&
+	   options->output_format!=CALCPRIME_OUTPUT_PARQUET){
+		result->error_message=
+			"DELTA_BINARY_PACKED requires Parquet output";
+		*out_result=result.release();
+		return CALCPRIME_STATUS_INVALID_ARGUMENT;
+	}
+	if(options->parquet_encoding==
+		   CALCPRIME_PARQUET_ENCODING_DELTA_BINARY_PACKED&&
+	   (options->parquet_delta_block_values==0||
+		(options->parquet_delta_block_values%128U)!=0U||
+		options->parquet_delta_block_values>(1U<<20))){
+		result->error_message=
+			"Parquet delta block values must be a multiple of 128 between 128 and 1048576";
 		*out_result=result.release();
 		return CALCPRIME_STATUS_INVALID_ARGUMENT;
 	}
@@ -669,7 +716,8 @@ calcprime_run_range(const calcprime_range_options*options,
 	if(opts.write_to_file){
 		try{
 			writer=std::make_unique<calcprime::PrimeWriter>(
-				true,opts.output_path,opts.output_format,opts.compress_zstd);
+				true,opts.output_path,opts.output_format,opts.compress_zstd,
+				opts.parquet_encoding,opts.parquet_delta_block_values);
 		}catch(const std::exception&ex){
 			result->status=CALCPRIME_STATUS_IO_ERROR;
 			result->error_message=ex.what();

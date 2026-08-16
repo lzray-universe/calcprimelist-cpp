@@ -104,6 +104,11 @@ cmake --build build --config Release
 
 # 保存为 Hugging Face Dataset Viewer 可直接预览的 Parquet
 ./build/calcprimelist --to 10000000 --print --out train.parquet --out-format parquet --zstd
+
+# DELTA_BINARY_PACKED，256 个差值一块，并继续使用 ZSTD 页压缩
+./build/calcprimelist --to 10000000 --print --out train-delta.parquet \
+  --out-format parquet --parquet-encoding delta \
+  --parquet-delta-block-values 256 --zstd
 ```
 
 > 支持科学计数法、十六进制与大小后缀：`--to 1e8`、`--to 0x1e5`、`--segment 1M`、`--tile 256K` 等。
@@ -137,6 +142,9 @@ calcprimelist --from A --to B [options]
   --out-group-range Y  按每组 Y 个自然数跨度导出（需 --print --out）
   --out-format FMT    text（默认）| binary | delta16 | parquet
   --zstd              使用 zstd（Parquet 页压缩或输出流压缩；若构建支持）
+  --parquet-encoding E  Parquet 值编码：plain（默认）或 delta
+  --parquet-delta-block-values N
+                       每个 delta block 的差值数，须为 128 的倍数
   --progress          在 stderr 打印分段进度与 ETA
   --time              打印耗时（微秒）
   --stats             打印配置统计（线程、缓存、分段等）
@@ -212,6 +220,8 @@ calcprimelist --from A --to B [options]
 ### `parquet`
 
 * 标准 Parquet 文件，单列名为 `prime`，类型为非空 `uint64`；可被 PyArrow、Pandas、Polars、DuckDB 及 Hugging Face Dataset Viewer 直接识别。
+* `--parquet-encoding delta` 启用标准 `DELTA_BINARY_PACKED`。编码器逐 block 优先使用 `uint16_t` 保存相邻差值，遇到更大的差值会自动回退到 64 位路径。
+* `--parquet-delta-block-values N` 设置每个 delta block 的差值数，范围为 128–1048576 且必须是 128 的倍数，默认值为 128。每个 miniblock 固定包含 32 个差值，实际位宽自动计算。
 * 使用 PLAIN 数据编码并按块生成 row group，不需要 Arrow/Thrift 运行库。
 * 建议使用 `.parquet` 扩展名。上传到 Hugging Face Dataset 仓库后即可在线预览，例如：
 
@@ -233,6 +243,7 @@ calcprimelist --from A --to B [options]
 
 * 对 `text` / `binary` / `delta16`，`--zstd` 会将完整输出字节流压缩为标准 zstd frame。
 * 对 `parquet`，`--zstd` 使用 Parquet 内部的 ZSTD 页压缩，文件本身仍是可直接读取的 `.parquet`，不会在外层再套一层 zstd frame。
+* `DELTA_BINARY_PACKED` 是值编码，ZSTD 是页压缩；两者可以同时使用。
 * 若当前构建不支持 zstd，传入 `--zstd` 会报错：`zstd not supported in this build`。
 * 兼容别名：`--out-format zstd` 或 `--out-format zstd+delta` 等价于 `--out-format delta16 --zstd`（已弃用）。
 
@@ -376,6 +387,8 @@ typedef struct calcprime_range_options {
     void*       progress_user_data;
     calcprime_cancel_token*        cancel_token;         // 可选：可取消
     int         compress_zstd;      // 1=启用 zstd；Parquet 使用内部页压缩
+    calcprime_parquet_encoding parquet_encoding;
+    size_t      parquet_delta_block_values; // 默认 128，须为 128 的倍数
 } calcprime_range_options;
 ```
 

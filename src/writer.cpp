@@ -47,15 +47,26 @@ inline std::uint16_t to_little_endian_u16(std::uint16_t value){
 } // namespace
 
 PrimeWriter::PrimeWriter(bool enabled,const std::string&path,
-						 PrimeOutputFormat format,bool use_zstd)
+						 PrimeOutputFormat format,bool use_zstd,
+						 ParquetEncoding parquet_encoding,
+						 std::size_t parquet_delta_block_values)
 	: enabled_(enabled),file_(nullptr),owns_file_(false),
 	  queue_capacity_(kDefaultQueueCapacity),stop_requested_(false),
 	  buffer_threshold_(kDefaultBufferThreshold),format_(format),
-	  use_zstd_(use_zstd),has_first_prime_(false),previous_prime_(0),
+	  use_zstd_(use_zstd),parquet_encoding_(parquet_encoding),
+	  parquet_delta_block_values_(parquet_delta_block_values),
+	  has_first_prime_(false),previous_prime_(0),
 	  zstd_cctx_(nullptr),file_offset_(0),parquet_num_rows_(0),
 	  parquet_footer_written_(false),io_error_(false){
 	if(!enabled_){
 		return;
+	}
+	if(parquet_encoding_==ParquetEncoding::DeltaBinaryPacked&&
+	   (parquet_delta_block_values_==0||
+		(parquet_delta_block_values_%128U)!=0U||
+		parquet_delta_block_values_>kParquetRowsPerGroup)){
+		throw std::invalid_argument(
+			"Parquet delta block values must be a multiple of 128 between 128 and 1048576");
 	}
 
 	if(path.empty()){
@@ -167,12 +178,18 @@ void PrimeWriter::write_segment(const std::vector<std::uint64_t>&primes){
 			std::size_t count=std::min(kParquetRowsPerGroup,
 								 primes.size()-offset);
 			std::string data;
-			data.resize(count*sizeof(std::uint64_t));
-			char*dest=data.data();
-			for(std::size_t i=0;i<count;++i){
-				std::uint64_t encoded=to_little_endian_u64(primes[offset+i]);
-				std::memcpy(dest,&encoded,sizeof(encoded));
-				dest+=sizeof(encoded);
+			if(parquet_encoding_==ParquetEncoding::DeltaBinaryPacked){
+				data=parquet::encode_delta_binary_packed(
+					primes.data()+offset,count,parquet_delta_block_values_);
+			}else{
+				data.resize(count*sizeof(std::uint64_t));
+				char*dest=data.data();
+				for(std::size_t i=0;i<count;++i){
+					std::uint64_t encoded=
+						to_little_endian_u64(primes[offset+i]);
+					std::memcpy(dest,&encoded,sizeof(encoded));
+					dest+=sizeof(encoded);
+				}
 			}
 			enqueue_chunk(Chunk{std::move(data),false,
 								static_cast<std::uint64_t>(count)});
@@ -214,8 +231,14 @@ void PrimeWriter::write_value(std::uint64_t value){
 		break;
 	}
 	case PrimeOutputFormat::Parquet:{
-		std::uint64_t encoded=to_little_endian_u64(value);
-		std::string chunk(reinterpret_cast<const char*>(&encoded),sizeof(encoded));
+		std::string chunk;
+		if(parquet_encoding_==ParquetEncoding::DeltaBinaryPacked){
+			chunk=parquet::encode_delta_binary_packed(
+				&value,1,parquet_delta_block_values_);
+		}else{
+			std::uint64_t encoded=to_little_endian_u64(value);
+			chunk.assign(reinterpret_cast<const char*>(&encoded),sizeof(encoded));
+		}
 		enqueue_chunk(Chunk{std::move(chunk),false,1});
 		break;
 	}
@@ -586,7 +609,10 @@ void PrimeWriter::write_parquet_chunk(const Chunk&chunk){
 	std::string header=parquet::make_data_page_header(
 		static_cast<std::int32_t>(chunk.value_count),
 		static_cast<std::int32_t>(chunk.data.size()),
-		static_cast<std::int32_t>(payload->size()));
+		static_cast<std::int32_t>(payload->size()),
+		parquet_encoding_==ParquetEncoding::DeltaBinaryPacked
+			?parquet::ValueEncoding::DeltaBinaryPacked
+			:parquet::ValueEncoding::Plain);
 	std::uint64_t page_offset=file_offset_;
 	write_file_bytes(header.data(),header.size());
 	write_file_bytes(payload->data(),payload->size());
@@ -617,7 +643,10 @@ void PrimeWriter::write_parquet_footer(){
 			row_group.total_uncompressed_size,row_group.total_compressed_size});
 	}
 	std::string footer=parquet::make_file_metadata(
-		metadata,static_cast<std::int64_t>(parquet_num_rows_),use_zstd_);
+		metadata,static_cast<std::int64_t>(parquet_num_rows_),use_zstd_,
+		parquet_encoding_==ParquetEncoding::DeltaBinaryPacked
+			?parquet::ValueEncoding::DeltaBinaryPacked
+			:parquet::ValueEncoding::Plain);
 	if(footer.size()>std::numeric_limits<std::uint32_t>::max()){
 		set_error("Parquet footer exceeds the 4 GiB format limit");
 		return;
